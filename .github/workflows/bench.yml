@@ -1,0 +1,198 @@
+name: Benchmark
+
+# Manually triggered comparison of kazu against scc and tokei on large
+# repositories. Every tool runs with its default ignore behaviour, so
+# .gitignore files are honored and no --no-gitignore flag is passed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: >-
+          Space-separated repositories. Short names (linux, zig, go, rust,
+          ghostty) or explicit owner/name pairs.
+        required: false
+        default: linux zig go rust ghostty
+        type: string
+      ref:
+        description: Branch, tag, or commit SHA to check out for every repository (empty = default branch)
+        required: false
+        default: ""
+        type: string
+      rounds:
+        description: Timed rounds per tool per repository
+        required: false
+        default: "7"
+        type: string
+      workers:
+        description: kazu worker count (0 = CPU count)
+        required: false
+        default: "0"
+        type: string
+      zig_version:
+        description: Zig version used to build kazu
+        required: false
+        default: "0.17.0"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TOKEI_VERSION: "15.0.0"
+
+jobs:
+  bench:
+    name: kazu vs scc vs tokei
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out kazu
+        uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ inputs.zig_version }}
+
+      - name: Build kazu
+        run: |
+          set -euo pipefail
+          zig version
+          zig build -Doptimize=fast
+          ./zig-out/bin/kazu --version
+
+      - name: Install scc
+        run: |
+          set -euo pipefail
+          go install github.com/boyter/scc/v3@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Restore cached tokei
+        id: tokei-cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/tokei
+          key: tokei-${{ runner.os }}-${{ env.TOKEI_VERSION }}
+
+      - name: Install tokei
+        run: |
+          set -euo pipefail
+          if [ ! -x "$RUNNER_TEMP/tokei/bin/tokei" ]; then
+            cargo install tokei --locked --version "$TOKEI_VERSION" --root "$RUNNER_TEMP/tokei"
+          fi
+          echo "$RUNNER_TEMP/tokei/bin" >> "$GITHUB_PATH"
+
+      - name: Verify tools
+        run: |
+          set -euo pipefail
+          "$GITHUB_WORKSPACE/zig-out/bin/kazu" --version
+          scc --version
+          tokei --version
+
+      - name: Clone repositories
+        env:
+          REPOS: ${{ inputs.repos }}
+          REF: ${{ inputs.ref }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/repos"
+          : > "$RUNNER_TEMP/repo-args.txt"
+
+          declare -A aliases=(
+            [linux]=torvalds/linux
+            [zig]=ziglang/zig
+            [ziglang]=ziglang/zig
+            [go]=golang/go
+            [rust]=rust-lang/rust
+            [ghostty]=ghostty-org/ghostty
+            [scc]=boyter/scc
+            [tokei]=XAMPPRocky/tokei
+          )
+
+          read -ra requested <<< "${REPOS//,/ }"
+          if [ "${#requested[@]}" -eq 0 ]; then
+            echo "::error::no repositories requested"
+            exit 1
+          fi
+
+          for item in "${requested[@]}"; do
+            slug="${aliases[$item]:-$item}"
+            if [[ "$slug" != */* ]]; then
+              echo "::error::cannot resolve '$item'; use a short name or owner/name"
+              exit 1
+            fi
+
+            dir="$RUNNER_TEMP/repos/${slug//\//__}"
+            if [ ! -d "$dir/.git" ]; then
+              echo "::group::Cloning $slug"
+              if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+                git init -q "$dir"
+                git -C "$dir" remote add origin "https://github.com/$slug.git"
+                git -C "$dir" fetch -q --depth 1 origin "$REF"
+                git -C "$dir" checkout -q FETCH_HEAD
+              elif [ -n "$REF" ]; then
+                git clone -q --depth 1 --branch "$REF" "https://github.com/$slug.git" "$dir"
+              else
+                git clone -q --depth 1 "https://github.com/$slug.git" "$dir"
+              fi
+              echo "::endgroup::"
+            fi
+
+            echo "$slug=$dir" >> "$RUNNER_TEMP/repo-args.txt"
+            du -sh "$dir"
+          done
+
+      - name: Run benchmark
+        run: |
+          set -euo pipefail
+
+          mapfile -t repo_entries < "$RUNNER_TEMP/repo-args.txt"
+          args=()
+          for entry in "${repo_entries[@]}"; do
+            args+=(--repo "$entry")
+          done
+
+          python3 .github/scripts/bench.py \
+            --kazu "$GITHUB_WORKSPACE/zig-out/bin/kazu" \
+            --scc "$(command -v scc)" \
+            --tokei "$(command -v tokei)" \
+            --rounds "${{ inputs.rounds }}" \
+            --workers "${{ inputs.workers }}" \
+            "${args[@]}" \
+            --json bench-results.json \
+            --markdown bench-results.md
+
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo "## Environment"
+            echo
+            echo "- Runner: \`$(uname -srm)\`"
+            echo "- CPUs: $(nproc)"
+            echo "- Zig: \`$(zig version 2>/dev/null || echo unknown)\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f bench-results.md ]; then
+            cat bench-results.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Benchmark did not produce a report." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: |
+            bench-results.json
+            bench-results.md
+          if-no-files-found: warn

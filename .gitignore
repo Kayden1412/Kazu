@@ -2,3 +2,6 @@
 zig-out/
 zig-pkg/
 *.o
+STRACE.txt
+ENVIRONMENT.local.md
+__pycache__/
