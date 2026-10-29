@@ -145,18 +145,30 @@ Benchmark methodology and recorded results, including comparisons with `scc`
 To compare `kazu` against `scc` and `tokei` on large repositories, run the
 **Benchmark** workflow from the Actions tab. It is `workflow_dispatch`-only and
 accepts a repository list (`linux`, `zig`, `go`, `rust`, `ghostty`, or any
-`owner/name`), an optional ref, the number of rounds, a worker count, and the
-Zig version. The workflow shallow-clones each repository, builds `kazu`, and
-runs all three tools with their default `.gitignore` behaviour. The Markdown
-report is written to the job summary and both the Markdown and JSON results are
-uploaded as an artifact.
+`owner/name`), an optional ref, the number of rounds, a worker count, the Zig
+version, and whether to add a combined run. The workflow shallow-clones each
+repository, builds `kazu`, and runs all three tools with their default
+`.gitignore` behaviour. With **combined** enabled it also scans the parent
+directory of every checkout as one large tree, which approximates a monorepo
+workload and exercises the walker, the worker pool, and per-directory
+`.gitignore` handling at scale. The Markdown report is written to the job
+summary and both the Markdown and JSON results are uploaded as an artifact.
 
-The same driver runs locally:
+The same driver runs locally. Pass the parent directory of the checkouts as an
+extra `--repo` entry to reproduce the combined run:
 
 ```sh
 python3 .github/scripts/bench.py \
   --kazu ./zig-out/bin/kazu --scc scc --tokei tokei \
   --repo "kazu=$PWD" --rounds 7 --markdown results.md
+
+# per-repository rows plus one row that scans all checkouts at once
+python3 .github/scripts/bench.py \
+  --kazu ./zig-out/bin/kazu --scc scc --tokei tokei \
+  --repo "linux=/srv/repos/linux" \
+  --repo "zig=/srv/repos/zig" \
+  --repo "all-repos=/srv/repos" \
+  --rounds 7 --markdown results.md
 ```
 
 ## Tests

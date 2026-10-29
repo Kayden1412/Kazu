@@ -185,6 +185,8 @@ Single-shot timings are meaningless on a shared host.
 - `.github/workflows/bench.yml` is the repeatable cross-tool comparison. It is
   `workflow_dispatch`-only, shallow-clones the requested repositories, and runs
   all three tools with their default ignore behaviour (no `--no-gitignore`).
+  The `combined` input adds one scan of the clone parent, so the tools are also
+  measured on a single large tree.
 
 ## Gotchas
 

@@ -34,6 +34,13 @@ on:
         required: false
         default: "0.17.0"
         type: string
+      combined:
+        description: >-
+          Also scan every cloned repository as a single tree, in addition to
+          the per-repository runs
+        required: false
+        default: true
+        type: boolean
 
 permissions:
   contents: read
@@ -99,6 +106,7 @@ jobs:
         env:
           REPOS: ${{ inputs.repos }}
           REF: ${{ inputs.ref }}
+          COMBINED: ${{ inputs.combined }}
         run: |
           set -euo pipefail
 
@@ -148,6 +156,13 @@ jobs:
             echo "$slug=$dir" >> "$RUNNER_TEMP/repo-args.txt"
             du -sh "$dir"
           done
+
+          # The clone parent contains every checkout and nothing else, so it is
+          # also a valid scan root. Scanning it measures all three tools on one
+          # large tree, which is the closest match to a real monorepo workload.
+          if [ "$COMBINED" = "true" ] && [ "$(wc -l < "$RUNNER_TEMP/repo-args.txt")" -ge 2 ]; then
+            echo "all-repos=$RUNNER_TEMP/repos" >> "$RUNNER_TEMP/repo-args.txt"
+          fi
 
       - name: Run benchmark
         run: |
