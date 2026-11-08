@@ -5,7 +5,7 @@ against a known baseline. Re-run the workloads below after touching the
 scanner, the I/O path, the walk, or the worker pool.
 
 - **Recorded:** 2026-10-29
-- **kazu:** 0.1.0, Zig 0.17.0, `-Doptimize=fast`, `aarch64-linux-musl`
+- **kazu:** 0.1.0, Zig 0.17.0, `-Doptimize=fast`
 - **scc:** 4.1.0
 
 > Host-specific notes (CPU topology, throttling, sandbox quirks) are kept in
@@ -28,7 +28,7 @@ scc --no-complexity --no-cocomo --no-gitignore --format json <path>
 Build:
 
 ```sh
-zig build -Doptimize=fast -Dtarget=aarch64-linux-musl
+zig build -Doptimize=fast
 ```
 
 ## kazu vs scc 4.1.0

@@ -53,6 +53,20 @@ pub const Summary = struct {
     }
 };
 
+/// One row in per-file mode.  `files` is implicit: every entry is one file.
+pub const FileSummary = struct {
+    path: []const u8,
+    lang: u16,
+    lines: u64 = 0,
+    blank: u64 = 0,
+    comment: u64 = 0,
+    code: u64 = 0,
+
+    pub fn language(self: FileSummary) []const u8 {
+        return languages.languages[self.lang].name;
+    }
+};
+
 pub const Totals = struct {
     files: u64 = 0,
     lines: u64 = 0,
@@ -77,6 +91,24 @@ pub fn sortRows(rows: []Summary, field: SortField) void {
     std.mem.sort(Summary, rows, field, lessThan);
 }
 
+/// Sort file rows by the same field used for language rows.  Every file has
+/// one file, so `files` falls back to the path, which keeps output stable.
+pub fn sortFiles(files: []FileSummary, field: SortField) void {
+    std.mem.sort(FileSummary, files, field, lessThanFile);
+}
+
+fn lessThanFile(field: SortField, a: FileSummary, b: FileSummary) bool {
+    switch (field) {
+        .name => return std.mem.order(u8, a.path, b.path) == .lt,
+        .files => {},
+        .lines => if (a.lines != b.lines) return a.lines > b.lines,
+        .blank => if (a.blank != b.blank) return a.blank > b.blank,
+        .comments => if (a.comment != b.comment) return a.comment > b.comment,
+        .code => if (a.code != b.code) return a.code > b.code,
+    }
+    return std.mem.order(u8, a.path, b.path) == .lt;
+}
+
 fn lessThan(field: SortField, a: Summary, b: Summary) bool {
     switch (field) {
         .name => return std.mem.order(u8, a.name(), b.name()) == .lt,
@@ -94,14 +126,15 @@ pub fn writeReport(
     writer: *std.Io.Writer,
     format: Format,
     rows: []const Summary,
+    files: ?[]const FileSummary,
     totals: Totals,
 ) !void {
     switch (format) {
-        .table => try writeTable(writer, rows, totals),
-        .json => try writeJson(writer, rows),
-        .md => try writeMarkdown(writer, rows, totals),
-        .html => try writeHtml(writer, rows, totals),
-        .zon => try writeZon(writer, rows),
+        .table => try writeTable(writer, rows, files, totals),
+        .json => try writeJson(writer, rows, files),
+        .md => try writeMarkdown(writer, rows, files, totals),
+        .html => try writeHtml(writer, rows, files, totals),
+        .zon => try writeZon(writer, rows, files),
     }
 }
 
@@ -125,7 +158,7 @@ fn digitCount(value: u64) usize {
     return text.len;
 }
 
-fn widthsFor(rows: []const Summary, totals: Totals) Widths {
+fn widthsFor(rows: []const Summary, files: ?[]const FileSummary, totals: Totals) Widths {
     var widths: Widths = .{
         .language = "Language".len,
         .files = @max("Files".len, digitCount(totals.files)),
@@ -137,12 +170,46 @@ fn widthsFor(rows: []const Summary, totals: Totals) Widths {
     for (rows) |row| {
         widths.language = @max(widths.language, row.name().len);
     }
+    if (files) |list| {
+        // File paths need room; cap the column so deep trees stay readable.
+        widths.language = @max(widths.language, min_file_column);
+        for (list) |file| {
+            widths.language = @max(widths.language, @min(displayPath(file.path).len, max_file_column));
+        }
+    }
     return widths;
+}
+
+const min_file_column: usize = 24;
+const max_file_column: usize = 60;
+
+/// Strip the leading `./` that `std.fs.path.join` adds when the scan root is
+/// the current directory.
+fn displayPath(path: []const u8) []const u8 {
+    return if (std.mem.startsWith(u8, path, "./")) path[2..] else path;
 }
 
 fn writeLeft(writer: *std.Io.Writer, text: []const u8, width: usize) !void {
     try writer.writeAll(text);
     if (text.len < width) try writer.splatByteAll(' ', width - text.len);
+}
+
+/// Write `text` left-aligned in `width` columns.  Overlong paths keep their
+/// tail and are prefixed with `~`, so the numeric columns stay aligned.
+fn writeLeftTruncated(writer: *std.Io.Writer, text: []const u8, width: usize) !void {
+    if (text.len <= width) {
+        try writeLeft(writer, text, width);
+        return;
+    }
+
+    var start = text.len - (width - 1);
+    while (start < text.len and (text[start] & 0xC0) == 0x80) : (start += 1) {}
+
+    try writer.writeByte('~');
+    const shown = text[start..];
+    try writer.writeAll(shown);
+    const used = 1 + shown.len;
+    if (used < width) try writer.splatByteAll(' ', width - used);
 }
 
 fn writeRight(writer: *std.Io.Writer, text: []const u8, width: usize) !void {
@@ -186,8 +253,29 @@ fn writeTableRow(
     try writer.writeByte('\n');
 }
 
-fn writeTable(writer: *std.Io.Writer, rows: []const Summary, totals: Totals) !void {
-    const widths = widthsFor(rows, totals);
+fn writeFileTableRow(writer: *std.Io.Writer, file: FileSummary, widths: Widths) !void {
+    try writeLeftTruncated(writer, displayPath(file.path), widths.language);
+    try writer.writeAll("  ");
+    // File rows have no file count of their own; leave the column blank.
+    try writer.splatByteAll(' ', widths.files);
+    try writer.writeAll("  ");
+    try writeNumber(writer, file.lines, widths.lines);
+    try writer.writeAll("  ");
+    try writeNumber(writer, file.blank, widths.blank);
+    try writer.writeAll("  ");
+    try writeNumber(writer, file.comment, widths.comment);
+    try writer.writeAll("  ");
+    try writeNumber(writer, file.code, widths.code);
+    try writer.writeByte('\n');
+}
+
+fn writeTable(
+    writer: *std.Io.Writer,
+    rows: []const Summary,
+    files: ?[]const FileSummary,
+    totals: Totals,
+) !void {
+    const widths = widthsFor(rows, files, totals);
     const width = widths.total();
 
     try writeSeparator(writer, width);
@@ -207,6 +295,12 @@ fn writeTable(writer: *std.Io.Writer, rows: []const Summary, totals: Totals) !vo
 
     for (rows) |row| {
         try writeTableRow(writer, row.name(), row.files, row.lines, row.blank, row.comment, row.code, widths);
+        if (files) |list| {
+            for (list) |file| {
+                if (file.lang != row.lang) continue;
+                try writeFileTableRow(writer, file, widths);
+            }
+        }
     }
 
     try writeSeparator(writer, width);
@@ -218,7 +312,39 @@ fn writeJsonString(writer: *std.Io.Writer, text: []const u8) !void {
     try json.Stringify.encodeJsonString(text, .{}, writer);
 }
 
-fn writeJson(writer: *std.Io.Writer, rows: []const Summary) !void {
+fn writeJsonFile(writer: *std.Io.Writer, file: FileSummary) !void {
+    try writer.writeAll("  {\n    \"Name\": ");
+    try writeJsonString(writer, displayPath(file.path));
+    try writer.writeAll(",\n    \"Language\": ");
+    try writeJsonString(writer, file.language());
+    try writer.writeAll(",\n    \"Files\": 1");
+    try writer.writeAll(",\n    \"Lines\": ");
+    try writer.print("{d}", .{file.lines});
+    try writer.writeAll(",\n    \"Blank\": ");
+    try writer.print("{d}", .{file.blank});
+    try writer.writeAll(",\n    \"Comment\": ");
+    try writer.print("{d}", .{file.comment});
+    try writer.writeAll(",\n    \"Code\": ");
+    try writer.print("{d}", .{file.code});
+    try writer.writeAll("\n  }");
+}
+
+fn writeJson(
+    writer: *std.Io.Writer,
+    rows: []const Summary,
+    files: ?[]const FileSummary,
+) !void {
+    if (files) |list| {
+        try writer.writeAll("[\n");
+        for (list, 0..) |file, i| {
+            try writeJsonFile(writer, file);
+            if (i + 1 < list.len) try writer.writeByte(',');
+            try writer.writeByte('\n');
+        }
+        try writer.writeAll("]\n");
+        return;
+    }
+
     try writer.writeAll("[\n");
     for (rows, 0..) |row, i| {
         try writer.writeAll("  {\n    \"Name\": ");
@@ -247,7 +373,12 @@ fn writeMarkdownEscaped(writer: *std.Io.Writer, text: []const u8) !void {
     }
 }
 
-fn writeMarkdown(writer: *std.Io.Writer, rows: []const Summary, totals: Totals) !void {
+fn writeMarkdown(
+    writer: *std.Io.Writer,
+    rows: []const Summary,
+    files: ?[]const FileSummary,
+    totals: Totals,
+) !void {
     try writer.writeAll("| Language | Files | Lines | Blank | Comment | Code |\n");
     try writer.writeAll("| :--- | ---: | ---: | ---: | ---: | ---: |\n");
     for (rows) |row| {
@@ -256,6 +387,16 @@ fn writeMarkdown(writer: *std.Io.Writer, rows: []const Summary, totals: Totals) 
         try writer.print(" | {d} | {d} | {d} | {d} | {d} |\n", .{
             row.files, row.lines, row.blank, row.comment, row.code,
         });
+        if (files) |list| {
+            for (list) |file| {
+                if (file.lang != row.lang) continue;
+                try writer.writeAll("| ");
+                try writeMarkdownEscaped(writer, displayPath(file.path));
+                try writer.print(" |  | {d} | {d} | {d} | {d} |\n", .{
+                    file.lines, file.blank, file.comment, file.code,
+                });
+            }
+        }
     }
     try writer.print("| **Total** | **{d}** | **{d}** | **{d}** | **{d}** | **{d}** |\n", .{
         totals.files, totals.lines, totals.blank, totals.comment, totals.code,
@@ -275,7 +416,12 @@ fn writeHtmlEscaped(writer: *std.Io.Writer, text: []const u8) !void {
     }
 }
 
-fn writeHtml(writer: *std.Io.Writer, rows: []const Summary, totals: Totals) !void {
+fn writeHtml(
+    writer: *std.Io.Writer,
+    rows: []const Summary,
+    files: ?[]const FileSummary,
+    totals: Totals,
+) !void {
     try writer.writeAll(
         \\<!DOCTYPE html>
         \\<html lang="en">
@@ -310,6 +456,16 @@ fn writeHtml(writer: *std.Io.Writer, rows: []const Summary, totals: Totals) !voi
         try writer.print("</td><td class=\"num\">{d}</td><td class=\"num\">{d}</td><td class=\"num\">{d}</td><td class=\"num\">{d}</td><td class=\"num\">{d}</td></tr>\n", .{
             row.files, row.lines, row.blank, row.comment, row.code,
         });
+        if (files) |list| {
+            for (list) |file| {
+                if (file.lang != row.lang) continue;
+                try writer.writeAll("    <tr><td>");
+                try writeHtmlEscaped(writer, displayPath(file.path));
+                try writer.print("</td><td class=\"num\"></td><td class=\"num\">{d}</td><td class=\"num\">{d}</td><td class=\"num\">{d}</td><td class=\"num\">{d}</td></tr>\n", .{
+                    file.lines, file.blank, file.comment, file.code,
+                });
+            }
+        }
     }
 
     try writer.writeAll("  </tbody>\n  <tfoot>\n    <tr><td>Total</td>");
@@ -319,7 +475,38 @@ fn writeHtml(writer: *std.Io.Writer, rows: []const Summary, totals: Totals) !voi
     try writer.writeAll("</tr>\n  </tfoot>\n</table>\n</body>\n</html>\n");
 }
 
-fn writeZon(writer: *std.Io.Writer, rows: []const Summary) !void {
+fn writeZonFile(writer: *std.Io.Writer, file: FileSummary) !void {
+    try writer.writeAll("    .{\n        .name = \"");
+    try writer.print("{f}", .{std.zig.fmtString(displayPath(file.path))});
+    try writer.writeAll("\",\n        .language = \"");
+    try writer.print("{f}", .{std.zig.fmtString(file.language())});
+    try writer.writeAll("\",\n        .files = 1,\n        .lines = ");
+    try writer.print("{d}", .{file.lines});
+    try writer.writeAll(",\n        .blank = ");
+    try writer.print("{d}", .{file.blank});
+    try writer.writeAll(",\n        .comment = ");
+    try writer.print("{d}", .{file.comment});
+    try writer.writeAll(",\n        .code = ");
+    try writer.print("{d}", .{file.code});
+    try writer.writeAll(",\n    },\n");
+}
+
+fn writeZon(
+    writer: *std.Io.Writer,
+    rows: []const Summary,
+    files: ?[]const FileSummary,
+) !void {
+    if (files) |list| {
+        if (list.len == 0) {
+            try writer.writeAll(".{}\n");
+            return;
+        }
+        try writer.writeAll(".{\n");
+        for (list) |file| try writeZonFile(writer, file);
+        try writer.writeAll("}\n");
+        return;
+    }
+
     if (rows.len == 0) {
         try writer.writeAll(".{}\n");
         return;
@@ -353,7 +540,7 @@ test "json output is valid JSON" {
     var rows = [_]Summary{
         .{ .lang = languages.byExtension("zig").?, .files = 2, .lines = 10, .blank = 2, .comment = 3, .code = 5 },
     };
-    try writeReport(&allocating.writer, .json, &rows, total(&rows));
+    try writeReport(&allocating.writer, .json, &rows, null, total(&rows));
 
     const Parsed = struct {
         Name: []const u8,
@@ -381,7 +568,7 @@ test "zon output is valid ZON" {
         .{ .lang = languages.byExtension("zig").?, .files = 2, .lines = 10, .blank = 2, .comment = 3, .code = 5 },
         .{ .lang = languages.byExtension("py").?, .files = 1, .lines = 4, .blank = 1, .comment = 1, .code = 2 },
     };
-    try writeReport(&allocating.writer, .zon, &rows, total(&rows));
+    try writeReport(&allocating.writer, .zon, &rows, null, total(&rows));
 
     const source = try gpa.dupeSentinel(u8, allocating.writer.buffer[0..allocating.writer.end], 0);
     defer gpa.free(source);
@@ -409,4 +596,169 @@ test "zon output is valid ZON" {
     try std.testing.expectEqualStrings("Zig", parsed[0].name);
     try std.testing.expectEqual(@as(u64, 5), parsed[0].code);
     try std.testing.expectEqualStrings("Python", parsed[1].name);
+}
+
+test "file rows sort by the selected field then path" {
+    var files = [_]FileSummary{
+        .{ .path = "b.c", .lang = 0, .code = 5 },
+        .{ .path = "a.c", .lang = 0, .code = 5 },
+        .{ .path = "c.c", .lang = 0, .code = 9 },
+    };
+    sortFiles(&files, .code);
+
+    try std.testing.expectEqualStrings("c.c", files[0].path);
+    try std.testing.expectEqualStrings("a.c", files[1].path);
+    try std.testing.expectEqualStrings("b.c", files[2].path);
+
+    // Every file row has one file, so `files` sorts by path instead.
+    sortFiles(&files, .files);
+    try std.testing.expectEqualStrings("a.c", files[0].path);
+    try std.testing.expectEqualStrings("b.c", files[1].path);
+    try std.testing.expectEqualStrings("c.c", files[2].path);
+}
+
+test "long file paths are truncated from the left" {
+    const gpa = std.testing.allocator;
+    const zig = languages.byExtension("zig").?;
+
+    var allocating: std.Io.Writer.Allocating = .init(gpa);
+    defer allocating.deinit();
+
+    const long_path = "a/very/deeply/nested/directory/structure/that/is/long/long_file_name_here.c";
+    var rows = [_]Summary{
+        .{ .lang = zig, .files = 1, .lines = 1, .code = 1 },
+    };
+    var files = [_]FileSummary{
+        .{ .path = long_path, .lang = zig, .lines = 1, .code = 1 },
+    };
+    try writeReport(&allocating.writer, .table, &rows, &files, total(&rows));
+
+    const out = allocating.writer.buffer[0..allocating.writer.end];
+    try std.testing.expect(std.mem.indexOf(u8, out, "~sted/directory/structure/that/is/long/long_file_name_here.c") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, long_path) == null);
+}
+
+test "by-file json reports one object per file" {
+    const gpa = std.testing.allocator;
+    const zig = languages.byExtension("zig").?;
+
+    var allocating: std.Io.Writer.Allocating = .init(gpa);
+    defer allocating.deinit();
+
+    var rows = [_]Summary{
+        .{ .lang = zig, .files = 2, .lines = 15, .blank = 3, .comment = 4, .code = 8 },
+    };
+    var files = [_]FileSummary{
+        .{ .path = "./src/main.zig", .lang = zig, .lines = 10, .blank = 2, .comment = 3, .code = 5 },
+        .{ .path = "./src/count.zig", .lang = zig, .lines = 5, .blank = 1, .comment = 1, .code = 3 },
+    };
+    try writeReport(&allocating.writer, .json, &rows, &files, total(&rows));
+
+    const Parsed = struct {
+        Name: []const u8,
+        Language: []const u8,
+        Files: u64,
+        Lines: u64,
+        Blank: u64,
+        Comment: u64,
+        Code: u64,
+    };
+    const parsed = try std.json.parseFromSlice([]Parsed, gpa, allocating.writer.buffer[0..allocating.writer.end], .{});
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.len);
+    try std.testing.expectEqualStrings("src/main.zig", parsed.value[0].Name);
+    try std.testing.expectEqualStrings("Zig", parsed.value[0].Language);
+    try std.testing.expectEqual(@as(u64, 1), parsed.value[0].Files);
+    try std.testing.expectEqual(@as(u64, 5), parsed.value[0].Code);
+    try std.testing.expectEqualStrings("src/count.zig", parsed.value[1].Name);
+}
+
+test "by-file table lists files under their language" {
+    const gpa = std.testing.allocator;
+    const zig = languages.byExtension("zig").?;
+
+    var allocating: std.Io.Writer.Allocating = .init(gpa);
+    defer allocating.deinit();
+
+    var rows = [_]Summary{
+        .{ .lang = zig, .files = 2, .lines = 15, .blank = 3, .comment = 4, .code = 8 },
+    };
+    var files = [_]FileSummary{
+        .{ .path = "./src/main.zig", .lang = zig, .lines = 10, .blank = 2, .comment = 3, .code = 5 },
+        .{ .path = "./src/count.zig", .lang = zig, .lines = 5, .blank = 1, .comment = 1, .code = 3 },
+    };
+    try writeReport(&allocating.writer, .table, &rows, &files, total(&rows));
+
+    const out = allocating.writer.buffer[0..allocating.writer.end];
+    try std.testing.expect(std.mem.indexOf(u8, out, "src/main.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "src/count.zig") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "./src") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Total") != null);
+}
+
+test "by-file markdown and html include file rows" {
+    const gpa = std.testing.allocator;
+    const zig = languages.byExtension("zig").?;
+
+    var rows = [_]Summary{
+        .{ .lang = zig, .files = 1, .lines = 10, .blank = 2, .comment = 3, .code = 5 },
+    };
+    var files = [_]FileSummary{
+        .{ .path = "./src/main.zig", .lang = zig, .lines = 10, .blank = 2, .comment = 3, .code = 5 },
+    };
+
+    var md: std.Io.Writer.Allocating = .init(gpa);
+    defer md.deinit();
+    try writeReport(&md.writer, .md, &rows, &files, total(&rows));
+    try std.testing.expect(std.mem.indexOf(u8, md.writer.buffer[0..md.writer.end], "| src/main.zig |  | 10 | 2 | 3 | 5 |") != null);
+
+    var html: std.Io.Writer.Allocating = .init(gpa);
+    defer html.deinit();
+    try writeReport(&html.writer, .html, &rows, &files, total(&rows));
+    try std.testing.expect(std.mem.indexOf(u8, html.writer.buffer[0..html.writer.end], "<td>src/main.zig</td><td class=\"num\"></td>") != null);
+}
+
+test "by-file zon emits the language for each file" {
+    const gpa = std.testing.allocator;
+    const zig = languages.byExtension("zig").?;
+
+    var allocating: std.Io.Writer.Allocating = .init(gpa);
+    defer allocating.deinit();
+
+    var rows = [_]Summary{
+        .{ .lang = zig, .files = 1, .lines = 10, .blank = 2, .comment = 3, .code = 5 },
+    };
+    var files = [_]FileSummary{
+        .{ .path = "./src/main.zig", .lang = zig, .lines = 10, .blank = 2, .comment = 3, .code = 5 },
+    };
+    try writeReport(&allocating.writer, .zon, &rows, &files, total(&rows));
+
+    const source = try gpa.dupeSentinel(u8, allocating.writer.buffer[0..allocating.writer.end], 0);
+    defer gpa.free(source);
+
+    const Parsed = struct {
+        name: []const u8,
+        language: []const u8,
+        files: u64,
+        lines: u64,
+        blank: u64,
+        comment: u64,
+        code: u64,
+    };
+
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    var diagnostics: std.zon.parse.Diagnostics = undefined;
+    const parsed = try std.zon.parse.fromSlice([]Parsed, .{
+        .gpa = gpa,
+        .arena = arena.allocator(),
+        .source = source,
+        .diagnostics = &diagnostics,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.len);
+    try std.testing.expectEqualStrings("src/main.zig", parsed[0].name);
+    try std.testing.expectEqualStrings("Zig", parsed[0].language);
+    try std.testing.expectEqual(@as(u64, 1), parsed[0].files);
 }

@@ -25,6 +25,10 @@ const max_gitignore_size: usize = 1024 * 1024;
 /// Files are counted in chunks so a worker never allocates a buffer the size
 /// of the file.  One buffer is allocated per worker and reused for every file.
 const read_buffer_size: usize = 64 * 1024;
+/// `scc` treats a file as binary when a NUL byte appears in its first 10,000
+/// bytes; grep, git and ripgrep use the same heuristic.  Binary files are not
+/// counted.
+const binary_scan_limit: u64 = 10_000;
 
 const default_excluded_dirs = [_][]const u8{
     ".git",
@@ -34,10 +38,23 @@ const default_excluded_dirs = [_][]const u8{
     "zig-cache",
     ".zig-cache",
     "zig-out",
+    "zig-pkg",
     "__pycache__",
     ".venv",
     "venv",
     "target",
+};
+
+/// Lockfiles are generated dependency data, not source.  These names match
+/// `scc`'s default `--exclude-file` list, and like `scc` the match is a
+/// substring of the basename.
+const default_excluded_files = [_][]const u8{
+    "package-lock.json",
+    "Cargo.lock",
+    "yarn.lock",
+    "pubspec.lock",
+    "Podfile.lock",
+    "pnpm-lock.yaml",
 };
 
 const help_text =
@@ -50,6 +67,8 @@ const help_text =
     \\  -f, --format <fmt>        Output format: table (default), json, md, html, zon
     \\  -s, --sort <field>        Sort rows by: files, lines, blank, comments, code, name
     \\  -w, --workers <n>         Number of counting workers (default: CPU count)
+    \\      --by-file             Show one row per file instead of per language
+    \\      --include-symlinks    Count symlinked files (off by default)
     \\      --exclude-dir <name>  Skip a directory name (repeatable)
     \\      --include-ext <ext>   Only count these extensions (repeatable)
     \\      --exclude-ext <ext>   Skip these extensions (repeatable)
@@ -62,6 +81,7 @@ const help_text =
     \\code, comment, or blank; mixed code/comment lines count as code.
     \\
     \\.gitignore files are honored by default; use --no-gitignore to disable.
+    \\Binary files are skipped; symlinks are only counted with --include-symlinks.
     \\
     \\Examples:
     \\  kazu
@@ -80,6 +100,8 @@ const Config = struct {
     include_exts: []const []const u8 = &.{},
     exclude_exts: []const []const u8 = &.{},
     gitignore: bool = true,
+    by_file: bool = false,
+    include_symlinks: bool = false,
 };
 
 const Action = union(enum) {
@@ -96,6 +118,59 @@ const FileTask = struct {
 const FileResult = struct {
     lang: u16,
     counts: count.Counts,
+};
+
+/// Remembers which files have already been counted so a symlink that resolves
+/// to a file in the tree is not counted twice, matching `scc`.  Keys are
+/// canonical paths: walked files use `<root real path>/<relative path>` and
+/// symlinks use their resolved target, so both spell the same file the same
+/// way.  Only allocated when `--include-symlinks` is set.
+const SymlinkDedup = struct {
+    arena: std.heap.ArenaAllocator,
+    seen: std.StringHashMapUnmanaged(void) = .empty,
+    /// Canonical path of the directory currently being walked.
+    root_real: []const u8 = "",
+
+    fn init(gpa: std.mem.Allocator) SymlinkDedup {
+        return .{ .arena = std.heap.ArenaAllocator.init(gpa) };
+    }
+
+    fn deinit(self: *SymlinkDedup) void {
+        self.seen.deinit(self.arena.allocator());
+        self.arena.deinit();
+    }
+
+    fn contains(self: *const SymlinkDedup, key: []const u8) bool {
+        return self.seen.contains(key);
+    }
+
+    fn insert(self: *SymlinkDedup, key: []const u8) !void {
+        const allocator = self.arena.allocator();
+        const owned = try allocator.dupe(u8, key);
+        try self.seen.put(allocator, owned, {});
+    }
+
+    /// Canonical key for a path relative to the walk root, formatted into
+    /// `buffer`.  Returns null when the root has no canonical path.
+    fn relativeKey(
+        self: *const SymlinkDedup,
+        relative: []const u8,
+        buffer: []u8,
+    ) ?[]const u8 {
+        if (self.root_real.len == 0) return null;
+        const separator: []const u8 = if (self.root_real[self.root_real.len - 1] == '/') "" else "/";
+        return std.fmt.bufPrint(buffer, "{s}{s}{s}", .{ self.root_real, separator, relative }) catch null;
+    }
+
+    fn containsRelative(self: *const SymlinkDedup, relative: []const u8, buffer: []u8) bool {
+        const key = self.relativeKey(relative, buffer) orelse return false;
+        return self.contains(key);
+    }
+
+    fn insertRelative(self: *SymlinkDedup, relative: []const u8, buffer: []u8) !void {
+        const key = self.relativeKey(relative, buffer) orelse return;
+        try self.insert(key);
+    }
 };
 
 pub fn main(init: std.process.Init) !void {
@@ -155,6 +230,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8) !Action {
     var sort_value: format.SortField = .code;
     var workers: ?usize = null;
     var use_gitignore = true;
+    var by_file = false;
+    var include_symlinks = false;
     var show_help = false;
     var show_version = false;
 
@@ -213,6 +290,10 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8) !Action {
             const value = optionValue(option, args, &i) orelse
                 return invalid("option '{s}' requires a value", .{option.name});
             try exclude_exts.append(arena, value);
+        } else if (std.mem.eql(u8, option.name, "--by-file")) {
+            by_file = true;
+        } else if (std.mem.eql(u8, option.name, "--include-symlinks")) {
+            include_symlinks = true;
         } else if (std.mem.eql(u8, option.name, "--no-gitignore")) {
             use_gitignore = false;
         } else {
@@ -232,6 +313,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8) !Action {
         .include_exts = include_exts.items,
         .exclude_exts = exclude_exts.items,
         .gitignore = use_gitignore,
+        .by_file = by_file,
+        .include_symlinks = include_symlinks,
     };
     return .{ .run = config };
 }
@@ -251,6 +334,9 @@ const Batcher = struct {
     io: std.Io,
     workers: usize,
     stats: []format.Summary,
+    /// When set, each counted file is retained for `--by-file` output and the
+    /// batch hands ownership of the path to this list instead of freeing it.
+    files: ?*std.ArrayList(format.FileSummary) = null,
     tasks: std.ArrayList(FileTask) = .empty,
     results: std.ArrayList(?FileResult) = .empty,
 
@@ -268,6 +354,10 @@ const Batcher = struct {
 
         try self.results.resize(self.gpa, self.tasks.items.len);
         @memset(self.results.items, null);
+
+        // Reserve room up front so a successful count can always move its path
+        // into the per-file list without a second allocation.
+        if (self.files) |files| try files.ensureUnusedCapacity(self.gpa, self.tasks.items.len);
 
         var next = std.atomic.Value(usize).init(0);
         var group: std.Io.Group = .init;
@@ -293,8 +383,24 @@ const Batcher = struct {
         }
 
         for (self.tasks.items, self.results.items) |task, maybe_result| {
-            self.gpa.free(task.path);
-            const result = maybe_result orelse continue;
+            const result = maybe_result orelse {
+                self.gpa.free(task.path);
+                continue;
+            };
+
+            if (self.files) |files| {
+                files.appendAssumeCapacity(.{
+                    .path = task.path,
+                    .lang = result.lang,
+                    .lines = result.counts.lines,
+                    .blank = result.counts.blank,
+                    .comment = result.counts.comment,
+                    .code = result.counts.code,
+                });
+            } else {
+                self.gpa.free(task.path);
+            }
+
             const stat = &self.stats[result.lang];
             stat.files += 1;
             stat.lines += result.counts.lines;
@@ -324,16 +430,29 @@ fn run(init: std.process.Init, config: Config) !void {
         stat.* = .{ .lang = @intCast(index) };
     }
 
+    // In per-file mode the batcher transfers ownership of each counted path
+    // here instead of freeing it, so this list must release them.
+    var files: std.ArrayList(format.FileSummary) = .empty;
+    defer {
+        for (files.items) |file| gpa.free(file.path);
+        files.deinit(gpa);
+    }
+
     var batcher = Batcher{
         .gpa = gpa,
         .io = io,
         .workers = config.workers,
         .stats = stats,
+        .files = if (config.by_file) &files else null,
     };
     defer batcher.deinit();
 
+    var dedup = SymlinkDedup.init(gpa);
+    defer dedup.deinit();
+    const dedup_ptr: ?*SymlinkDedup = if (config.include_symlinks) &dedup else null;
+
     for (config.paths) |path| {
-        walkRoot(gpa, io, &config, path, &batcher) catch |err| {
+        walkRoot(gpa, io, &config, path, dedup_ptr, &batcher) catch |err| {
             std.log.err("kazu: {s}: {}", .{ path, err });
         };
     }
@@ -347,11 +466,12 @@ fn run(init: std.process.Init, config: Config) !void {
     }
 
     format.sortRows(rows.items, config.sort);
+    format.sortFiles(files.items, config.sort);
     const totals = format.total(rows.items);
 
     var write_buffer: [64 * 1024]u8 = undefined;
     var writer = std.Io.File.stdout().writer(io, &write_buffer);
-    try format.writeReport(&writer.interface, config.format, rows.items, totals);
+    try format.writeReport(&writer.interface, config.format, rows.items, if (config.by_file) files.items else null, totals);
     try writer.interface.flush();
 }
 
@@ -407,6 +527,10 @@ fn processFile(
     while (true) {
         const read_len = try file.readPositional(io, &.{buffer}, offset);
         if (read_len == 0) break;
+        if (isBinaryChunk(buffer[0..read_len], offset)) {
+            std.log.debug("kazu: skipping {s}: binary file", .{task.path});
+            return null;
+        }
         offset += read_len;
         counter.feed(buffer[0..read_len]);
     }
@@ -414,30 +538,84 @@ fn processFile(
     return .{ .lang = lang_index.?, .counts = counter.finish() };
 }
 
+/// A NUL byte in the first 10,000 bytes marks the file as binary.  The check is
+/// limited so text files that happen to contain a NUL later are still counted,
+/// exactly like `scc`.
+fn isBinaryChunk(chunk: []const u8, offset: u64) bool {
+    if (offset >= binary_scan_limit) return false;
+    const remaining: usize = @intCast(binary_scan_limit - offset);
+    return std.mem.indexOfScalar(u8, chunk[0..@min(chunk.len, remaining)], 0) != null;
+}
+
 fn walkRoot(
     gpa: std.mem.Allocator,
     io: std.Io,
     config: *const Config,
     path: []const u8,
+    dedup: ?*SymlinkDedup,
     batcher: *Batcher,
 ) !void {
-    const stat = std.Io.Dir.cwd().statFile(io, path, .{}) catch |err| {
+    const stat = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = false }) catch |err| {
         std.log.err("kazu: cannot access {s}: {}", .{ path, err });
         return;
     };
 
-    switch (stat.kind) {
+    var kind = stat.kind;
+    if (kind == .sym_link) {
+        if (!config.include_symlinks) {
+            std.log.warn("kazu: skipping {s}: symlink (use --include-symlinks)", .{path});
+            return;
+        }
+        // An explicit symlink root is followed, like `scc`; the walk itself
+        // still never descends into symlinked directories.
+        const target = std.Io.Dir.cwd().statFile(io, path, .{ .follow_symlinks = true }) catch |err| {
+            std.log.warn("kazu: cannot follow symlink {s}: {}", .{ path, err });
+            return;
+        };
+        kind = target.kind;
+    }
+
+    switch (kind) {
         .directory => {
             var root = std.Io.Dir.cwd().openDir(io, path, .{ .iterate = true }) catch |err| {
                 std.log.warn("kazu: cannot open directory {s}: {}", .{ path, err });
                 return;
             };
             defer root.close(io);
-            try walkDir(io, gpa, config, path, root, batcher);
+
+            // Canonical root so walked files and resolved symlinks produce the
+            // same dedup key.
+            var root_real_buffer: [std.fs.max_path_bytes]u8 = undefined;
+            var walk_dedup = dedup;
+            if (dedup) |seen| {
+                const n = std.Io.Dir.cwd().realPathFile(io, path, &root_real_buffer) catch 0;
+                if (n > 0) {
+                    seen.root_real = root_real_buffer[0..n];
+                } else {
+                    walk_dedup = null;
+                }
+            }
+
+            try walkDir(io, gpa, config, path, root, walk_dedup, batcher);
         },
         .file => {
             const owned = try gpa.dupe(u8, path);
-            try queueFile(gpa, config, std.fs.path.basename(path), owned, batcher);
+            if (dedup) |seen| {
+                var key_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const n = std.Io.Dir.cwd().realPathFile(io, path, &key_buffer) catch 0;
+                if (n > 0) {
+                    const key = key_buffer[0..n];
+                    if (seen.contains(key)) {
+                        gpa.free(owned);
+                        return;
+                    }
+                    if (try queueFile(gpa, config, std.fs.path.basename(path), owned, batcher)) {
+                        try seen.insert(key);
+                    }
+                    return;
+                }
+            }
+            _ = try queueFile(gpa, config, std.fs.path.basename(path), owned, batcher);
         },
         else => std.log.warn("kazu: skipping {s}: not a regular file or directory", .{path}),
     }
@@ -449,6 +627,7 @@ fn walkDir(
     config: *const Config,
     root_path: []const u8,
     root: std.Io.Dir,
+    dedup: ?*SymlinkDedup,
     batcher: *Batcher,
 ) !void {
     var ignores = gitignore.Set.init(gpa);
@@ -488,6 +667,18 @@ fn walkDir(
 
         const depth = entry.depth();
 
+        // Readdir may report `unknown` on filesystems without d_type.  Resolve
+        // it without following symlinks so directories are still entered and
+        // non-regular files (FIFOs, sockets, devices) are skipped.
+        var effective = entry;
+        if (entry.kind == .unknown) {
+            const stat = entry.dir.statFile(io, entry.basename, .{ .follow_symlinks = false }) catch |err| {
+                std.log.warn("kazu: cannot stat {s}: {}", .{ entry.path, err });
+                continue;
+            };
+            effective.kind = stat.kind;
+        }
+
         // The selective walker pops exhausted directories without notifying the
         // caller.  Use the depth of the entry we just received to drop any
         // `.gitignore` files that no longer apply.
@@ -498,7 +689,7 @@ fn walkDir(
             ignores.pop();
         }
 
-        switch (entry.kind) {
+        switch (effective.kind) {
             .directory => {
                 // Prune before opening: the walker only descends when we call
                 // `enter`, so skipped trees cost a single readdir entry.
@@ -527,7 +718,7 @@ fn walkDir(
                     }
                 }
 
-                walker.enter(io, entry) catch |err| {
+                walker.enter(io, effective) catch |err| {
                     if (pushed_ignore) {
                         _ = ignore_depths.pop();
                         ignores.pop();
@@ -536,10 +727,46 @@ fn walkDir(
                     continue;
                 };
             },
-            .file, .unknown => {
+            .file => {
                 if (ignores.isIgnored(entry.path, false)) continue;
                 const child = try std.fs.path.join(gpa, &.{ root_path, entry.path });
-                try queueFile(gpa, config, entry.basename, child, batcher);
+                try queueWalked(gpa, config, dedup, entry.path, entry.basename, child, batcher);
+            },
+            .sym_link => {
+                // Symlinked directories are not followed: that risks cycles
+                // and differs from `scc`, whose walk only counts symlinked
+                // files.  An explicit symlink root is still followed.
+                if (!config.include_symlinks) continue;
+                if (ignores.isIgnored(entry.path, false)) continue;
+
+                const target = entry.dir.statFile(io, entry.basename, .{ .follow_symlinks = true }) catch |err| {
+                    std.log.debug("kazu: skipping symlink {s}: {}", .{ entry.path, err });
+                    continue;
+                };
+                if (target.kind != .file) continue;
+
+                const child = try std.fs.path.join(gpa, &.{ root_path, entry.path });
+
+                // Key the target's canonical path so a link that resolves to a
+                // file already counted is skipped.
+                var key_buffer: [std.fs.max_path_bytes]u8 = undefined;
+                const key_len = entry.dir.realPathFile(io, entry.basename, &key_buffer) catch 0;
+                const key: ?[]const u8 = if (key_len > 0) key_buffer[0..key_len] else null;
+
+                if (dedup) |seen| {
+                    if (key) |canonical| {
+                        if (seen.contains(canonical)) {
+                            gpa.free(child);
+                            continue;
+                        }
+                    }
+                }
+
+                if (try queueFile(gpa, config, entry.basename, child, batcher)) {
+                    if (dedup) |seen| {
+                        if (key) |canonical| try seen.insert(canonical);
+                    }
+                }
             },
             else => {},
         }
@@ -603,27 +830,55 @@ fn readGitignore(
     return owned;
 }
 
+/// Queues a regular file found by the walk.  When symlink support is on, the
+/// canonical walk path is checked first so a file that was already counted
+/// through a symlink is not counted again.
+fn queueWalked(
+    gpa: std.mem.Allocator,
+    config: *const Config,
+    dedup: ?*SymlinkDedup,
+    relative: []const u8,
+    name: []const u8,
+    path: []const u8,
+    batcher: *Batcher,
+) !void {
+    var key_buffer: [std.fs.max_path_bytes]u8 = undefined;
+
+    if (dedup) |seen| {
+        if (seen.containsRelative(relative, &key_buffer)) {
+            gpa.free(path);
+            return;
+        }
+    }
+
+    if (try queueFile(gpa, config, name, path, batcher)) {
+        if (dedup) |seen| try seen.insertRelative(relative, &key_buffer);
+    }
+}
+
 /// Takes ownership of `path`, freeing it if the file is not queued.  On a
 /// successful hand-off the batch owns the path and frees it after counting.
+/// Returns whether the file was queued.
 fn queueFile(
     gpa: std.mem.Allocator,
     config: *const Config,
     name: []const u8,
     path: []const u8,
     batcher: *Batcher,
-) !void {
+) !bool {
     if (!isIncludedFile(config, name)) {
         gpa.free(path);
-        return;
+        return false;
     }
 
     const lang = languages.detectName(name);
     if (lang == null and !canHaveShebang(name)) {
         gpa.free(path);
-        return;
+        return false;
     }
 
     try batcher.push(.{ .path = path, .lang = lang });
+    return true;
 }
 
 fn isExcludedDir(config: *const Config, name: []const u8) bool {
@@ -648,6 +903,17 @@ fn hasExtension(list: []const []const u8, extension: []const u8) bool {
 }
 
 fn isIncludedFile(config: *const Config, name: []const u8) bool {
+    // `.gitignore` and `.ignore` are read for their rules, but they are
+    // metadata rather than source, so they are not counted.  `scc` does the
+    // same; `.dockerignore` is still reported as "Docker ignore".
+    if (std.mem.eql(u8, name, ".gitignore") or std.mem.eql(u8, name, ".ignore")) {
+        return false;
+    }
+
+    for (default_excluded_files) |excluded| {
+        if (std.mem.indexOf(u8, name, excluded) != null) return false;
+    }
+
     const extension = extensionOf(name);
 
     if (config.include_exts.len > 0 and !hasExtension(config.include_exts, extension)) {
@@ -681,4 +947,102 @@ test "gitignore is enabled by default and can be disabled" {
         else => unreachable,
     };
     try std.testing.expect(!disabled_config.gitignore);
+}
+
+test "gitignore and ignore files are read but not counted" {
+    const config = Config{ .workers = 1 };
+
+    try std.testing.expect(!isIncludedFile(&config, ".gitignore"));
+    try std.testing.expect(!isIncludedFile(&config, ".ignore"));
+    try std.testing.expect(isIncludedFile(&config, ".dockerignore"));
+    try std.testing.expect(isIncludedFile(&config, "main.zig"));
+}
+
+test "default lockfiles are not counted" {
+    const config = Config{ .workers = 1 };
+
+    for (default_excluded_files) |name| {
+        try std.testing.expect(!isIncludedFile(&config, name));
+    }
+    // Matching is by substring, like scc's --exclude-file.
+    try std.testing.expect(!isIncludedFile(&config, "my-package-lock.json"));
+    try std.testing.expect(isIncludedFile(&config, "main.c"));
+    try std.testing.expect(isIncludedFile(&config, "lockfile.json"));
+}
+
+test "by-file mode is parsed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const default_action = try parseArgs(allocator, &.{ "kazu", "." });
+    const default_config = switch (default_action) {
+        .run => |config| config,
+        else => unreachable,
+    };
+    try std.testing.expect(!default_config.by_file);
+
+    const action = try parseArgs(allocator, &.{ "kazu", "--by-file", "." });
+    const config = switch (action) {
+        .run => |value| value,
+        else => unreachable,
+    };
+    try std.testing.expect(config.by_file);
+}
+
+test "include-symlinks is parsed" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const allocator = arena.allocator();
+
+    const default_action = try parseArgs(allocator, &.{ "kazu", "." });
+    const default_config = switch (default_action) {
+        .run => |config| config,
+        else => unreachable,
+    };
+    try std.testing.expect(!default_config.include_symlinks);
+
+    const action = try parseArgs(allocator, &.{ "kazu", "--include-symlinks", "." });
+    const config = switch (action) {
+        .run => |value| value,
+        else => unreachable,
+    };
+    try std.testing.expect(config.include_symlinks);
+}
+
+test "binary detection only scans the first 10000 bytes" {
+    try std.testing.expect(!isBinaryChunk("int x;\n", 0));
+    try std.testing.expect(isBinaryChunk("abc\x00def", 0));
+
+    var text: [10_016]u8 = @splat('a');
+    try std.testing.expect(!isBinaryChunk(&text, 0));
+
+    // A NUL at byte 10000 is outside the scanned prefix.
+    text[10_000] = 0;
+    try std.testing.expect(!isBinaryChunk(&text, 0));
+    try std.testing.expect(!isBinaryChunk(text[9_990..], 9_990));
+    try std.testing.expect(!isBinaryChunk(text[10_000..], 10_000));
+    try std.testing.expect(!isBinaryChunk("\x00", 10_000));
+
+    // The NUL is checked only while it falls inside the prefix.
+    try std.testing.expect(!isBinaryChunk("ab\x00", 9_998));
+    try std.testing.expect(isBinaryChunk("ab\x00", 9_997));
+}
+
+test "symlink dedup compares walked paths with resolved targets" {
+    var dedup = SymlinkDedup.init(std.testing.allocator);
+    defer dedup.deinit();
+    dedup.root_real = "/tree";
+
+    var buffer: [std.fs.max_path_bytes]u8 = undefined;
+    try std.testing.expect(!dedup.containsRelative("src/a.c", &buffer));
+
+    try dedup.insertRelative("src/a.c", &buffer);
+    try std.testing.expect(dedup.contains("/tree/src/a.c"));
+    try std.testing.expect(dedup.containsRelative("src/a.c", &buffer));
+    try std.testing.expect(!dedup.containsRelative("src/b.c", &buffer));
+
+    // Two symlinks to the same outside target are counted once.
+    try dedup.insert("/outside/lib.c");
+    try std.testing.expect(dedup.contains("/outside/lib.c"));
 }

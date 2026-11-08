@@ -11,11 +11,7 @@ zig build -Doptimize=fast
 ./zig-out/bin/kazu .
 ```
 
-On Termux or other systems where Zig cannot find the native libc, build a static musl binary:
-
-```sh
-zig build -Doptimize=fast -Dtarget=aarch64-linux-musl
-```
+The native build is a static binary; no target override is needed.
 
 ## Usage
 
@@ -30,6 +26,8 @@ With no paths, the current directory is scanned.
 | `-f, --format <fmt>` | Output format: `table` (default), `json`, `md`, `html`, `zon` |
 | `-s, --sort <field>` | Sort rows by `files`, `lines`, `blank`, `comments`, `code`, or `name` |
 | `-w, --workers <n>` | Number of counting workers (default: CPU count) |
+| `--by-file` | Show one row per file instead of per language |
+| `--include-symlinks` | Count symlinked files; off by default |
 | `--exclude-dir <name>` | Skip a directory name; repeatable |
 | `--include-ext <ext>` | Only count these extensions; repeatable |
 | `--exclude-ext <ext>` | Skip these extensions; repeatable |
@@ -38,6 +36,8 @@ With no paths, the current directory is scanned.
 | `-v, --version` | Show the version |
 
 Numeric sorts are descending with the language name as a tie-breaker. `name` sorts alphabetically.
+
+With `--by-file`, the same sort is applied to file rows instead, using the path as the tie-breaker; `files` sorts by path because every row is one file. In the table, Markdown, and HTML formats the file rows are grouped under their language summary, with the `Files` column left blank.
 
 ### Examples
 
@@ -53,6 +53,12 @@ kazu -f md -s files --exclude-dir vendor .
 
 # Only Zig and C sources
 kazu --include-ext zig --include-ext c --format html .
+
+# Per-file rows, largest files first
+kazu --by-file --sort lines .
+
+# Count symlinked files as well
+kazu --include-symlinks .
 ```
 
 ## Output formats
@@ -100,6 +106,47 @@ Total           3     15      2        5     8
 }
 ```
 
+### Per-file output
+
+`--by-file` adds one row per counted file. The table, Markdown, and HTML formats
+list each file under its language summary; the `Files` cell of a file row is
+blank because the row describes a single file:
+
+```text
+────────────────────────────────────────────────────────────────
+Language                  Files  Lines  Blank  Comment  Code
+────────────────────────────────────────────────────────────────
+Zig                           2     75     10        6    59
+src/main.zig                        48      6        4    38
+src/count.zig                       27      4        2    21
+────────────────────────────────────────────────────────────────
+Total                         2     75     10        6    59
+────────────────────────────────────────────────────────────────
+```
+
+Long paths are truncated from the left and prefixed with `~` so the numeric
+columns stay aligned.
+
+`json` and `zon` emit a flat array of file objects instead, each carrying its
+own language and a `Files` count of `1`:
+
+```json
+[
+  {
+    "Name": "src/main.zig",
+    "Language": "Zig",
+    "Files": 1,
+    "Lines": 48,
+    "Blank": 6,
+    "Comment": 4,
+    "Code": 38
+  }
+]
+```
+
+The per-file JSON totals still add up to the per-language report, so the output
+can be aggregated without rescanning.
+
 ## How lines are counted
 
 - A line with only whitespace is **blank**.
@@ -111,7 +158,11 @@ Total           3     15      2        5     8
 
 The language table covers the languages and file types recognized by `scc` 4.1.0. When two scc languages share an extension (for example `m` for Objective-C and MATLAB), the extension keeps the language kazu already used.
 
-By default these directories are skipped: `.git`, `.hg`, `.svn`, `node_modules`, `zig-cache`, `.zig-cache`, `zig-out`, `__pycache__`, `.venv`, `venv`, and `target`. Symlinks are not followed. Files larger than 256 MiB are skipped with a warning.
+By default these directories are skipped: `.git`, `.hg`, `.svn`, `node_modules`, `zig-cache`, `.zig-cache`, `zig-out`, `zig-pkg`, `__pycache__`, `.venv`, `venv`, and `target`. These lockfiles are skipped by name: `package-lock.json`, `Cargo.lock`, `yarn.lock`, `pubspec.lock`, `Podfile.lock`, and `pnpm-lock.yaml`. Symlinks are not followed, and non-regular files (FIFOs, sockets, devices) are skipped. Files larger than 256 MiB are skipped with a warning.
+
+`--include-symlinks` counts symlinked files. Symlinked directories are still not entered during a walk, and a symlink that resolves to a file already counted is skipped, so a link inside the tree does not double count its target. An explicit symlink path on the command line is followed instead: a link to a directory is walked, and a link to a file is counted.
+
+Binary files are skipped: a file with a NUL byte in its first 10,000 bytes is treated as binary, the same heuristic `grep`, `git`, and `ripgrep` use. Unlike `scc`, the check applies to every language, not only C and Java.
 
 Files are counted incrementally in fixed-size chunks, so memory use stays flat no matter how large a file or line is.
 
@@ -137,6 +188,10 @@ Use `--no-gitignore` to disable `.gitignore` handling:
 kazu --no-gitignore .
 ```
 
+`.gitignore` files are still read for their rules, but they are not counted as
+a language; `.ignore` files are not counted either. `.dockerignore` is still
+reported as `Docker ignore`, matching `scc`.
+
 ## Performance
 
 Benchmark methodology and recorded results, including comparisons with `scc`
@@ -146,13 +201,16 @@ To compare `kazu` against `scc` and `tokei` on large repositories, run the
 **Benchmark** workflow from the Actions tab. It is `workflow_dispatch`-only and
 accepts a repository list (`linux`, `zig`, `go`, `rust`, `ghostty`, or any
 `owner/name`), an optional ref, the number of rounds, a worker count, the Zig
-version, and whether to add a combined run. The workflow shallow-clones each
-repository, builds `kazu`, and runs all three tools with their default
-`.gitignore` behaviour. With **combined** enabled it also scans the parent
-directory of every checkout as one large tree, which approximates a monorepo
-workload and exercises the walker, the worker pool, and per-directory
-`.gitignore` handling at scale. The Markdown report is written to the job
-summary and both the Markdown and JSON results are uploaded as an artifact.
+version, whether to add a combined run, and toggles for per-file output
+(`--by-file` / `--files`) and for disabling ignore files on every tool. The
+workflow shallow-clones each repository, builds `kazu`, and runs all three
+tools with their default `.gitignore` behaviour unless the ignore toggle is
+enabled. With **combined** enabled it
+also scans the parent directory of every checkout as one large tree, which
+approximates a monorepo workload and exercises the walker, the worker pool, and
+per-directory `.gitignore` handling at scale. The Markdown report is written to
+the job summary and both the Markdown and JSON results are uploaded as an
+artifact.
 
 The same driver runs locally. Pass the parent directory of the checkouts as an
 extra `--repo` entry to reproduce the combined run:
@@ -171,12 +229,13 @@ python3 .github/scripts/bench.py \
   --rounds 7 --markdown results.md
 ```
 
+Pass `--by-file` and/or `--no-gitignore` to the driver to mirror the workflow
+toggles locally; both apply the matching flags to every tool.
+
 ## Tests
 
 ```sh
 zig build test
-# On Termux:
-zig build test -Dtarget=aarch64-linux-musl
 ```
 
 ## Layout

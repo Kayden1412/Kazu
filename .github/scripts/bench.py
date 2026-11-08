@@ -14,8 +14,8 @@ for context.
 Each tool is run once more with stdout captured to read its reported totals
 (files, lines, code, comments, blanks). That extra run is not timed.
 
-Ignore files are honored by all three tools by default, so no ignore-disabling
-flags are passed.
+Ignore files are honored by default. ``--no-gitignore`` disables them for every
+tool, and ``--by-file`` asks each tool for per-file output where it has one.
 """
 
 from __future__ import annotations
@@ -61,21 +61,45 @@ class ToolResult:
 # ---------------------------------------------------------------------------
 
 
-def kazu_command(executable: str, path: str, workers: int) -> list[str]:
+@dataclass(frozen=True)
+class Options:
+    """Benchmark-wide switches applied to every tool where it has an equivalent."""
+
+    by_file: bool = False
+    no_gitignore: bool = False
+
+
+def kazu_command(executable: str, path: str, workers: int, options: Options) -> list[str]:
     argv = [executable, "--format", "json"]
     if workers > 0:
         argv += ["--workers", str(workers)]
+    if options.by_file:
+        argv.append("--by-file")
+    if options.no_gitignore:
+        argv.append("--no-gitignore")
     return argv + [path]
 
 
-def scc_command(executable: str, path: str) -> list[str]:
-    # scc honors .gitignore by default; do not pass --no-gitignore.
-    return [executable, "--no-complexity", "--no-cocomo", "--format", "json", path]
+def scc_command(executable: str, path: str, options: Options) -> list[str]:
+    argv = [executable, "--no-complexity", "--no-cocomo", "--format", "json"]
+    if options.by_file:
+        argv.append("--by-file")
+    if options.no_gitignore:
+        # --no-gitignore only covers .gitignore; scc also reads .ignore and
+        # .sccignore, which tokei's --no-ignore would disable.
+        argv += ["--no-gitignore", "--no-ignore", "--no-scc-ignore"]
+    return argv + [path]
 
 
-def tokei_command(executable: str, path: str) -> list[str]:
-    # tokei honors .gitignore by default; do not pass --no-ignore.
-    return [executable, "--output", "json", path]
+def tokei_command(executable: str, path: str, options: Options) -> list[str]:
+    # tokei's JSON output always carries per-file reports, so --files changes
+    # only the terminal renderer; it is still the closest per-file switch.
+    argv = [executable, "--output", "json"]
+    if options.by_file:
+        argv.append("--files")
+    if options.no_gitignore:
+        argv.append("--no-ignore")
+    return argv + [path]
 
 
 # ---------------------------------------------------------------------------
@@ -277,16 +301,29 @@ def render_markdown(
     versions: dict[str, str],
     rounds: int,
     workers: int,
+    options: Options,
     generated_at: str,
 ) -> str:
     worker_label = "default (CPU count)" if workers <= 0 else str(workers)
+    ignore_label = (
+        "disabled by every tool (`--no-gitignore`, plus `--no-ignore` and "
+        "`--no-scc-ignore` for scc)"
+        if options.no_gitignore
+        else "honored by every tool (no `--no-gitignore`)"
+    )
+    by_file_label = (
+        "on (kazu/scc `--by-file`, tokei `--files`)"
+        if options.by_file
+        else "off (per-language totals)"
+    )
     lines: list[str] = [
         "# kazu vs scc vs tokei",
         "",
         f"- **Generated:** {generated_at}",
         f"- **Rounds:** {rounds} (interleaved; run order alternates each round)",
         f"- **kazu workers:** {worker_label}",
-        "- **Ignore files:** honored by every tool (no `--no-gitignore`)",
+        f"- **Ignore files:** {ignore_label}",
+        f"- **Per-file output:** {by_file_label}",
     ]
     for name in tools:
         lines.append(f"- **{name}:** `{versions.get(name, 'unknown')}`")
@@ -418,6 +455,19 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=0,
         help="kazu worker count; 0 leaves the default (CPU count)",
     )
+    parser.add_argument(
+        "--by-file",
+        action="store_true",
+        help="ask every tool for per-file output (kazu/scc --by-file, tokei --files)",
+    )
+    parser.add_argument(
+        "--no-gitignore",
+        action="store_true",
+        help=(
+            "disable ignore files for every tool (kazu --no-gitignore; "
+            "scc --no-gitignore --no-ignore --no-scc-ignore; tokei --no-ignore)"
+        ),
+    )
     parser.add_argument("--timeout", type=float, default=1800.0, help="per-run timeout in seconds")
     parser.add_argument("--json", dest="json_path", help="write machine-readable results here")
     parser.add_argument("--markdown", dest="markdown_path", help="write a Markdown report here")
@@ -449,6 +499,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     args = parse_args(argv)
+    options = Options(by_file=args.by_file, no_gitignore=args.no_gitignore)
 
     tool_paths = {"kazu": args.kazu, "scc": args.scc, "tokei": args.tokei}
     tools = [name for name in ("kazu", "scc", "tokei") if tool_paths[name]]
@@ -459,6 +510,10 @@ def main(argv: list[str]) -> int:
     for name in tools:
         print(f"  {name}: {versions[name]} ({tool_paths[name]})", file=sys.stderr)
     print(f"rounds: {args.rounds}, kazu workers: {args.workers or 'default'}", file=sys.stderr)
+    print(
+        f"by-file: {options.by_file}, no-gitignore: {options.no_gitignore}",
+        file=sys.stderr,
+    )
 
     results: list[dict[str, Any]] = []
     for label, path in args.repos:
@@ -472,9 +527,9 @@ def main(argv: list[str]) -> int:
             continue
 
         commands = {
-            "kazu": kazu_command(tool_paths["kazu"], path, args.workers),
-            "scc": scc_command(tool_paths["scc"], path),
-            "tokei": tokei_command(tool_paths["tokei"], path),
+            "kazu": kazu_command(tool_paths["kazu"], path, args.workers, options),
+            "scc": scc_command(tool_paths["scc"], path, options),
+            "tokei": tokei_command(tool_paths["tokei"], path, options),
         }
 
         for name in tools:
@@ -505,6 +560,8 @@ def main(argv: list[str]) -> int:
         "generated_at": generated_at,
         "rounds": args.rounds,
         "workers": args.workers,
+        "by_file": options.by_file,
+        "no_gitignore": options.no_gitignore,
         "versions": versions,
         "tools": tools,
         "repos": results,
@@ -516,7 +573,7 @@ def main(argv: list[str]) -> int:
             handle.write("\n")
 
     markdown = render_markdown(
-        results, tools, versions, args.rounds, args.workers, generated_at
+        results, tools, versions, args.rounds, args.workers, options, generated_at
     )
     if args.markdown_path:
         with open(args.markdown_path, "w", encoding="utf-8") as handle:

@@ -17,17 +17,17 @@ per-language totals.
 
 | Task | Command |
 | --- | --- |
-| Build (release) | `zig build -Doptimize=fast -Dtarget=aarch64-linux-musl` |
+| Build (release) | `zig build -Doptimize=fast` |
 | Run | `./zig-out/bin/kazu .` |
 | Fast test loop | `zig test src/root.zig` |
-| Full test step | `zig build test -Dtarget=aarch64-linux-musl` |
+| Full test step | `zig build test` |
 | Format | `zig fmt src/*.zig build.zig` |
 | Format check | `zig fmt --check src/*.zig build.zig` |
 
-**If native `zig build` fails during libc detection, pass
-`-Dtarget=aarch64-linux-musl`.** `zig test src/root.zig` works natively and is
-the quickest way to validate library changes. Host-specific notes live in
-`ENVIRONMENT.local.md` (local, gitignored).
+Native `zig build` works on Termux; no target override is needed now that the
+`zio` dependency is gone. `zig test src/root.zig` is the quickest way to
+validate library changes. Host-specific notes live in `ENVIRONMENT.local.md`
+(local, gitignored).
 
 `zig build test` builds two test executables: one for the library module
 (`src/root.zig`) and one for the CLI module (`src/main.zig`). Both must pass.
@@ -56,16 +56,23 @@ the quickest way to validate library changes. Host-specific notes live in
    carry a root-relative path; the walker owns the directory handles.
 3. `queueFile` applies `--include-ext` / `--exclude-ext`, detects the language
    from the basename, and appends a `FileTask` to the current batch. It takes
-   ownership of the path string; the batch frees it.
+   ownership of the path string; the batch frees it. It returns whether the
+   file was queued, which lets `queueWalked` record the canonical path in the
+   `--include-symlinks` dedup set only for counted files.
 4. `Batcher.flush` splits one batch (4096 files) across a short-lived
    `std.Io.Group` with one `std.atomic.Value(usize)` counter. Workers read the
    file in 64 KiB chunks through `std.Io` (or sniff a `#!` line when the
-   language is unknown) and feed them to `count.Counter`. Each worker owns one
-   reusable read buffer; nothing is allocated per file. Results are written
-   into a pre-sized slot array, so no channel or collector is involved.
+   language is unknown), reject a file whose first 10,000 bytes contain a NUL,
+   and feed the rest to `count.Counter`. Each worker owns one reusable read
+   buffer; nothing is allocated per file. Results are written into a pre-sized
+   slot array, so no channel or collector is involved.
 5. After `Group.await`, the batcher frees the paths and folds each
-   `FileResult` into the `format.Summary` for its language.
-6. `format.writeReport` renders the selected format.
+   `FileResult` into the `format.Summary` for its language. With `--by-file`
+   it instead hands each counted path to a `FileSummary` list; that list owns
+   the strings and frees them after the report is written.
+6. `format.writeReport` renders the selected format. Per-file mode passes the
+   file list alongside the language rows: table/Markdown/HTML nest file rows
+   under their language, while JSON/ZON emit a flat per-file array.
 
 Keep counting and formatting logic out of `main.zig`; it should stay
 orchestration-only so the pure modules remain testable.
@@ -83,7 +90,8 @@ orchestration-only so the pure modules remain testable.
 - Allocator discipline matters. `run` uses the GPA from `std.process.Init`;
   path strings are owned by whoever receives them. `queueFile` frees paths it
   rejects, `Batcher.push` frees the path even when appending fails, and
-  `flush`/`deinit` free every accepted path.
+  `flush`/`deinit` free every accepted path. `queueWalked` frees the path when
+  the dedup set already holds it.
 - Avoid allocations in the hot path (`countLines` and `Counter.feed` work on
   borrowed slices; `Counter` carries at most `max_marker_len` bytes between
   chunks).
@@ -116,6 +124,9 @@ This is the most edit-prone file. Preserve these invariants:
 - The table covers `scc` 4.1.0, including text/data pseudo-languages (`Plain
   Text`, `CSV`, `License`, `Jupyter`, `Patch`, `gitignore`, `ignore`,
   `Docker ignore`). This is intentional; do not silently drop them.
+  `gitignore` and `ignore` remain detectable, but `isIncludedFile` filters
+  `.gitignore` / `.ignore` out of the count so `kazu` matches `scc`;
+  `.dockerignore` is still counted as `Docker ignore`.
 
 ## Counting semantics (`src/count.zig`)
 
@@ -157,7 +168,6 @@ divergences:
 
 - `kazu` counts `.zon` as Zig; `scc` does not.
 - `kazu` skips `.zig-cache`; `scc` descends into it.
-- `kazu` counts `.gitignore` / `.ignore`; `scc` skips them by default.
 - `scc` 4.1.0's ABAP entry uses a literal `\"` marker, so it misses real ABAP
   `"` comments. `kazu` handles them.
 - `scc` 4.1.0 misclassifies Zig `\\` multiline strings and `'"'` character
@@ -184,15 +194,34 @@ Single-shot timings are meaningless on a shared host.
   the scanner, the I/O path, or the worker pool.
 - `.github/workflows/bench.yml` is the repeatable cross-tool comparison. It is
   `workflow_dispatch`-only, shallow-clones the requested repositories, and runs
-  all three tools with their default ignore behaviour (no `--no-gitignore`).
-  The `combined` input adds one scan of the clone parent, so the tools are also
-  measured on a single large tree.
+  all three tools with their default ignore behaviour (no `--no-gitignore`)
+  unless the `no_gitignore` input is enabled, which adds
+  `--no-gitignore --no-ignore --no-scc-ignore` for scc and `--no-ignore` for
+  tokei. The `by_file` input switches all
+  three tools to per-file output (`--by-file` for kazu/scc, `--files` for
+  tokei; tokei's JSON always includes per-file reports). The `combined` input
+  adds one scan of the clone parent, so the tools are also measured on a single
+  large tree.
 
 ## Gotchas
 
 - This workspace is **not** a git repository. Do not assume `git status` or
   commits are available.
-- Symlinks are not followed.
+- Symlinks are not followed by default, and non-regular files (FIFOs, sockets,
+  devices) are always skipped. `.unknown` directory entries are stat'ed without
+  following symlinks so they resolve to a real file, directory, or skip.
+- `--include-symlinks` counts symlinked files. The walk never enters a
+  symlinked directory (that matches `scc` and avoids cycles); an explicit
+  symlink root is followed. `SymlinkDedup` keys walked files by
+  `<root real path>/<relative path>` and symlinks by their resolved target, so
+  a link that resolves to a file already counted is skipped. It is only
+  allocated when the flag is set.
+- A file with a NUL byte in its first 10,000 bytes is skipped as binary. `scc`
+  applies that check only in its C and Java counters and misses a NUL at the
+  start of a line, so `kazu` skips some files `scc` counts; this is intentional.
+- Lockfiles matching `scc`'s default `--exclude-file` list are skipped
+  (`package-lock.json`, `Cargo.lock`, `yarn.lock`, `pubspec.lock`,
+  `Podfile.lock`, `pnpm-lock.yaml`). The match is a substring of the basename.
 - Files over 256 MiB are skipped with a warning; `.gitignore` files over 1 MiB
   are ignored.
 - `--include-ext` filters on the file extension, so extensionless files (which

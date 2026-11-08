@@ -1,8 +1,10 @@
 name: Benchmark
 
 # Manually triggered comparison of kazu against scc and tokei on large
-# repositories. Every tool runs with its default ignore behaviour, so
-# .gitignore files are honored and no --no-gitignore flag is passed.
+# repositories. By default every tool runs with its default ignore behaviour,
+# so .gitignore files are honored and no --no-gitignore flag is passed. The
+# no_gitignore and by_file inputs switch all three tools into the matching
+# mode for the run.
 
 on:
   workflow_dispatch:
@@ -40,6 +42,20 @@ on:
           the per-repository runs
         required: false
         default: true
+        type: boolean
+      by_file:
+        description: >-
+          Ask every tool for per-file output (kazu/scc --by-file, tokei
+          --files); tokei's JSON always includes per-file reports
+        required: false
+        default: false
+        type: boolean
+      no_gitignore:
+        description: >-
+          Disable ignore files for every tool (kazu --no-gitignore; scc
+          --no-gitignore --no-ignore --no-scc-ignore; tokei --no-ignore)
+        required: false
+        default: false
         type: boolean
 
 permissions:
@@ -165,6 +181,9 @@ jobs:
           fi
 
       - name: Run benchmark
+        env:
+          BY_FILE: ${{ inputs.by_file }}
+          NO_GITIGNORE: ${{ inputs.no_gitignore }}
         run: |
           set -euo pipefail
 
@@ -174,12 +193,21 @@ jobs:
             args+=(--repo "$entry")
           done
 
+          modes=()
+          if [ "$BY_FILE" = "true" ]; then
+            modes+=(--by-file)
+          fi
+          if [ "$NO_GITIGNORE" = "true" ]; then
+            modes+=(--no-gitignore)
+          fi
+
           python3 .github/scripts/bench.py \
             --kazu "$GITHUB_WORKSPACE/zig-out/bin/kazu" \
             --scc "$(command -v scc)" \
             --tokei "$(command -v tokei)" \
             --rounds "${{ inputs.rounds }}" \
             --workers "${{ inputs.workers }}" \
+            "${modes[@]}" \
             "${args[@]}" \
             --json bench-results.json \
             --markdown bench-results.md
