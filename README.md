@@ -205,12 +205,12 @@ version, whether to add a combined run, and toggles for per-file output
 (`--by-file` / `--files`) and for disabling ignore files on every tool. The
 workflow shallow-clones each repository, builds `kazu`, and runs all three
 tools with their default `.gitignore` behaviour unless the ignore toggle is
-enabled. With **combined** enabled it
-also scans the parent directory of every checkout as one large tree, which
-approximates a monorepo workload and exercises the walker, the worker pool, and
-per-directory `.gitignore` handling at scale. The Markdown report is written to
-the job summary and both the Markdown and JSON results are uploaded as an
-artifact.
+enabled. With **combined** enabled it also scans the parent directory of every
+checkout as one large tree, which approximates a monorepo workload and
+exercises the walker, the worker pool, and per-directory `.gitignore` handling
+at scale. The Markdown report is written to the job summary and includes a text
+bar chart of peak memory per tool; the Markdown, JSON, and a standalone
+peak-memory SVG chart (`bench-memory.svg`) are uploaded as an artifact.
 
 The same driver runs locally. Pass the parent directory of the checkouts as an
 extra `--repo` entry to reproduce the combined run:
@@ -230,7 +230,8 @@ python3 .github/scripts/bench.py \
 ```
 
 Pass `--by-file` and/or `--no-gitignore` to the driver to mirror the workflow
-toggles locally; both apply the matching flags to every tool.
+toggles locally; both apply the matching flags to every tool. Add
+`--svg results.svg` to write the peak-memory chart next to the report.
 
 ## Tests
 

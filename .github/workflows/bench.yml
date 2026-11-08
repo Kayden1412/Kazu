@@ -210,7 +210,8 @@ jobs:
             "${modes[@]}" \
             "${args[@]}" \
             --json bench-results.json \
-            --markdown bench-results.md
+            --markdown bench-results.md \
+            --svg bench-memory.svg
 
       - name: Publish summary
         if: always()
@@ -238,4 +239,5 @@ jobs:
           path: |
             bench-results.json
             bench-results.md
+            bench-memory.svg
           if-no-files-found: warn

@@ -201,7 +201,9 @@ Single-shot timings are meaningless on a shared host.
   three tools to per-file output (`--by-file` for kazu/scc, `--files` for
   tokei; tokei's JSON always includes per-file reports). The `combined` input
   adds one scan of the clone parent, so the tools are also measured on a single
-  large tree.
+  large tree. `bench.py --svg` writes a grouped peak-RSS bar chart; the
+  workflow attaches it as `bench-memory.svg` and also renders a text bar chart
+  in the Markdown report (GitHub strips inline SVG from Markdown).
 
 ## Gotchas
 

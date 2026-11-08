@@ -284,6 +284,21 @@ def fmt_count(value: int | None) -> str:
     return "—" if value is None else f"{value:,}"
 
 
+def fmt_rss(kb: float) -> str:
+    """Format a peak RSS value reported in KiB (``ru_maxrss`` on Linux)."""
+    mib = kb / 1024.0
+    if mib >= 1024.0:
+        return f"{mib / 1024.0:.2f} GiB"
+    return f"{mib:.1f} MiB"
+
+
+def rss_bar(value: float, maximum: float, width: int = 24) -> str:
+    """Return a proportional bar for a Markdown code block."""
+    if maximum <= 0 or value <= 0:
+        return ""
+    return "█" * max(1, round(value / maximum * width))
+
+
 def tool_summary(result: ToolResult) -> dict[str, Any]:
     if result.error or not result.runs:
         return {"error": result.error or "no runs", "counts": result.counts}
@@ -303,6 +318,7 @@ def render_markdown(
     workers: int,
     options: Options,
     generated_at: str,
+    svg_name: str | None = None,
 ) -> str:
     worker_label = "default (CPU count)" if workers <= 0 else str(workers)
     ignore_label = (
@@ -325,6 +341,8 @@ def render_markdown(
         f"- **Ignore files:** {ignore_label}",
         f"- **Per-file output:** {by_file_label}",
     ]
+    if svg_name:
+        lines.append(f"- **Memory chart:** `{svg_name}`")
     for name in tools:
         lines.append(f"- **{name}:** `{versions.get(name, 'unknown')}`")
 
@@ -358,6 +376,27 @@ def render_markdown(
                 else:
                     cells.append("—")
             lines.append("| " + " | ".join(cells) + " |")
+
+        memory_rows: list[tuple[str, list[str]]] = []
+        for repo in usable:
+            values = []
+            for name in tools:
+                rss = repo["tools"].get(name, {}).get("maxrss_kb", {}).get("median")
+                values.append(fmt_rss(float(rss)) if rss else "—")
+            memory_rows.append((repo["repo"], values))
+
+        if any(any(value != "—" for value in values) for _, values in memory_rows):
+            lines += [
+                "",
+                "### Peak memory",
+                "",
+                "Median peak RSS (lower is better):",
+                "",
+                "| Repository | " + " | ".join(tools) + " |",
+                "| --- | " + " | ".join("---:" for _ in tools) + " |",
+            ]
+            for label, values in memory_rows:
+                lines.append("| " + " | ".join([label] + values) + " |")
 
     for repo in repos:
         lines += ["", f"## {repo['repo']}", ""]
@@ -394,10 +433,24 @@ def render_markdown(
                     low=fmt_duration(wall["min"]),
                     high=fmt_duration(wall["max"]),
                     cpu=fmt_duration(cpu["median"]),
-                    rss=f"{rss['median'] / 1024.0:.1f} MiB",
+                    rss=fmt_rss(rss["median"]),
                     ratio=ratio,
                 )
             )
+
+        memory = []
+        for name in tools:
+            rss = repo["tools"].get(name, {}).get("maxrss_kb", {}).get("median")
+            if rss:
+                memory.append((name, float(rss)))
+        if memory:
+            peak = max(value for _, value in memory)
+            name_width = max(len(name) for name, _ in memory)
+            lines += ["", "Peak memory (median peak RSS):", "", "```text"]
+            for name, value in memory:
+                bar = rss_bar(value, peak).ljust(24)
+                lines.append(f"{name.ljust(name_width)}  {bar}  {fmt_rss(value)}")
+            lines.append("```")
 
         lines += [
             "",
@@ -429,6 +482,127 @@ def render_markdown(
         "",
     ]
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Memory chart
+# ---------------------------------------------------------------------------
+
+_TOOL_COLORS = {
+    "kazu": "#2f81f7",
+    "scc": "#f0883e",
+    "tokei": "#3fb950",
+}
+
+
+def _svg_text(text: str) -> str:
+    return (
+        text.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+    )
+
+
+def render_memory_svg(repos: list[dict[str, Any]], tools: list[str]) -> str:
+    """Render a grouped horizontal bar chart of median peak RSS as SVG.
+
+    One group per repository, one bar per tool. The chart is a standalone file
+    so the workflow can attach it as an artifact; GitHub sanitizes inline SVG
+    out of Markdown, so the report also carries a text bar chart.
+    """
+    groups: list[tuple[str, list[tuple[str, float]]]] = []
+    for repo in repos:
+        values: list[tuple[str, float]] = []
+        for name in tools:
+            entry = repo.get("tools", {}).get(name, {})
+            rss = entry.get("maxrss_kb", {}).get("median")
+            if rss:
+                values.append((name, float(rss)))
+        if values:
+            groups.append((repo["repo"], values))
+
+    width = 900
+    left = 200
+    right = 120
+    top = 76
+    bottom = 44
+    bar_height = 20
+    bar_gap = 6
+    group_gap = 20
+    plot_width = width - left - right
+
+    body_height = sum(
+        len(values) * (bar_height + bar_gap) - bar_gap + group_gap
+        for _, values in groups
+    )
+    height = top + bottom + (body_height if groups else 0)
+
+    maximum = max((value for _, values in groups for _, value in values), default=0.0)
+    scale_max = maximum if maximum > 0 else 1.0
+
+    parts: list[str] = [
+        f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
+        f'viewBox="0 0 {width} {height}" role="img" '
+        'font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif">',
+        f'<rect width="{width}" height="{height}" fill="#ffffff"/>',
+        f'<text x="{left}" y="30" font-size="18" font-weight="600" fill="#1f2328">'
+        "Peak memory (median peak RSS)</text>",
+    ]
+
+    legend_entries = [(name, 12 + 6 + len(name) * 7) for name in tools]
+    legend_x = width - right - sum(entry_width + 16 for _, entry_width in legend_entries)
+    for name, entry_width in legend_entries:
+        parts.append(
+            f'<rect x="{legend_x}" y="16" width="12" height="12" rx="2" '
+            f'fill="{_TOOL_COLORS.get(name, "#8b949e")}"/>'
+        )
+        parts.append(
+            f'<text x="{legend_x + 18}" y="26" font-size="12" fill="#1f2328">'
+            f"{_svg_text(name)}</text>"
+        )
+        legend_x += entry_width + 16
+
+    if groups:
+        for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+            x = left + plot_width * fraction
+            parts.append(
+                f'<line x1="{x:.1f}" y1="{top}" x2="{x:.1f}" y2="{height - bottom}" '
+                'stroke="#d0d7de" stroke-width="1"/>'
+            )
+            parts.append(
+                f'<text x="{x:.1f}" y="{height - bottom + 18}" font-size="11" '
+                f'text-anchor="middle" fill="#57606a">{fmt_rss(scale_max * fraction)}</text>'
+            )
+
+        y = top
+        for label, values in groups:
+            group_height = len(values) * (bar_height + bar_gap) - bar_gap
+            parts.append(
+                f'<text x="{left - 12}" y="{y + group_height / 2 + 4:.1f}" font-size="13" '
+                f'font-weight="600" text-anchor="end" fill="#1f2328">{_svg_text(label)}</text>'
+            )
+            for name, value in values:
+                bar_width = max(2.0, plot_width * value / scale_max)
+                parts.append(
+                    f'<rect x="{left}" y="{y}" width="{bar_width:.1f}" height="{bar_height}" '
+                    f'rx="3" fill="{_TOOL_COLORS.get(name, "#8b949e")}">'
+                    f"<title>{_svg_text(name)}: {fmt_rss(value)}</title></rect>"
+                )
+                parts.append(
+                    f'<text x="{left + bar_width + 8:.1f}" y="{y + bar_height / 2 + 4:.1f}" '
+                    f'font-size="12" fill="#1f2328">{fmt_rss(value)}</text>'
+                )
+                y += bar_height + bar_gap
+            y += group_gap
+    else:
+        parts.append(
+            f'<text x="{left}" y="{top + 20}" font-size="13" fill="#57606a">'
+            "No peak RSS data</text>"
+        )
+
+    parts.append("</svg>")
+    return "\n".join(parts) + "\n"
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +645,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=1800.0, help="per-run timeout in seconds")
     parser.add_argument("--json", dest="json_path", help="write machine-readable results here")
     parser.add_argument("--markdown", dest="markdown_path", help="write a Markdown report here")
+    parser.add_argument(
+        "--svg",
+        dest="svg_path",
+        help="write a peak-memory chart (SVG) here",
+    )
     parser.add_argument(
         "--summary",
         dest="summary_path",
@@ -573,7 +752,14 @@ def main(argv: list[str]) -> int:
             handle.write("\n")
 
     markdown = render_markdown(
-        results, tools, versions, args.rounds, args.workers, options, generated_at
+        results,
+        tools,
+        versions,
+        args.rounds,
+        args.workers,
+        options,
+        generated_at,
+        os.path.basename(args.svg_path) if args.svg_path else None,
     )
     if args.markdown_path:
         with open(args.markdown_path, "w", encoding="utf-8") as handle:
@@ -581,6 +767,9 @@ def main(argv: list[str]) -> int:
     if args.summary_path:
         with open(args.summary_path, "a", encoding="utf-8") as handle:
             handle.write(markdown)
+    if args.svg_path:
+        with open(args.svg_path, "w", encoding="utf-8") as handle:
+            handle.write(render_memory_svg(results, tools))
 
     failures = [repo for repo in results if repo.get("error")]
     failed_tools = [
