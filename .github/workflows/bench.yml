@@ -24,13 +24,13 @@ on:
       rounds:
         description: Timed rounds per tool per repository
         required: false
-        default: "7"
-        type: string
+        default: 7
+        type: number
       workers:
         description: kazu worker count (0 = CPU count)
         required: false
-        default: "0"
-        type: string
+        default: 0
+        type: number
       zig_version:
         description: Zig version used to build kazu
         required: false
