@@ -2,7 +2,7 @@
 
 A fast, parallel source code counter in the spirit of [`scc`](https://github.com/boyter/scc) and `cloc`.
 
-`kazu` walks a source tree, detects each file's language, classifies every line as **code**, **comment**, or **blank**, and reports the totals per language. The walk uses `std.Io.Dir.walkSelectively`, so excluded and gitignored directories are pruned before they are opened. Files are counted in parallel batches: each batch is split across a group of `std.Io` workers, and every read goes through `std.Io` as well, so the binary has no runtime dependencies beyond Zig's standard library.
+`kazu` walks a source tree, detects each file's language, classifies every line as **code**, **comment**, or **blank**, and reports the totals per language. The walk uses `std.Io.Dir.walkSelectively`, so excluded and ignored directories are pruned before they are opened. Files are counted in parallel batches: each batch is split across a group of `std.Io` workers, and every read goes through `std.Io` as well, so the binary has no runtime dependencies beyond Zig's standard library.
 
 ## Build
 
@@ -32,6 +32,7 @@ With no paths, the current directory is scanned.
 | `--include-ext <ext>` | Only count these extensions; repeatable |
 | `--exclude-ext <ext>` | Skip these extensions; repeatable |
 | `--no-gitignore` | Do not read `.gitignore` files |
+| `--no-ignore` | Do not read `.ignore` files |
 | `-h, --help` | Show help |
 | `-v, --version` | Show the version |
 
@@ -168,8 +169,8 @@ Files are counted incrementally in fixed-size chunks, so memory use stays flat n
 
 ## Ignore rules
 
-By default, `kazu` reads `.gitignore` files as it walks the tree. Standard
-gitignore syntax is supported:
+By default, `kazu` reads `.gitignore` and `.ignore` files as it walks the
+tree. Both use standard gitignore syntax:
 
 - comments and blank lines
 - negation with `!`
@@ -177,40 +178,51 @@ gitignore syntax is supported:
 - directory-only patterns such as `build/`
 - `*`, `?`, character classes and `**`
 
-Patterns are matched against paths relative to the scan root. A `.gitignore`
+Patterns are matched against paths relative to the scan root. An ignore file
 inside a subdirectory applies only below that directory, and its rules override
-rules from parent directories. If a directory itself is ignored, it is pruned,
-so negated patterns cannot re-include files inside it (matching git).
+rules from parent directories. When a directory has both files, `.ignore` is
+loaded after `.gitignore`, so its rules win. If a directory itself is ignored,
+it is pruned, so negated patterns cannot re-include files inside it (matching
+git).
 
-Use `--no-gitignore` to disable `.gitignore` handling:
+Use `--no-gitignore` or `--no-ignore` to disable one kind of ignore file:
 
 ```sh
 kazu --no-gitignore .
+kazu --no-ignore .
 ```
 
-`.gitignore` files are still read for their rules, but they are not counted as
-a language; `.ignore` files are not counted either. `.dockerignore` is still
-reported as `Docker ignore`, matching `scc`.
+`.gitignore` and `.ignore` files are still read for their rules, but they are
+not counted as a language. `.dockerignore` is still reported as
+`Docker ignore`, matching `scc`.
 
 ## Performance
 
 Benchmark methodology and recorded results, including comparisons with `scc`
 4.1.0, are in [BENCHMARKS.md](BENCHMARKS.md).
 
-To compare `kazu` against `scc` and `tokei` on large repositories, run the
-**Benchmark** workflow from the Actions tab. It is `workflow_dispatch`-only and
-accepts a repository list (`linux`, `zig`, `go`, `rust`, `ghostty`, or any
-`owner/name`), an optional ref, the number of rounds, a worker count, the Zig
-version, whether to add a combined run, and toggles for per-file output
-(`--by-file` / `--files`) and for disabling ignore files on every tool. The
-workflow shallow-clones each repository, builds `kazu`, and runs all three
-tools with their default `.gitignore` behaviour unless the ignore toggle is
-enabled. With **combined** enabled it also scans the parent directory of every
-checkout as one large tree, which approximates a monorepo workload and
-exercises the walker, the worker pool, and per-directory `.gitignore` handling
-at scale. The Markdown report is written to the job summary and includes a text
-bar chart of peak memory per tool; the Markdown, JSON, and a standalone
-peak-memory SVG chart (`bench-memory.svg`) are uploaded as an artifact.
+To compare `kazu` against `scc`, `tokei`, and `mezura` on large repositories,
+run the **Benchmark** workflow from the Actions tab. It is
+`workflow_dispatch`-only and accepts a repository list (`linux`, `zig`, `go`,
+`rust`, `ghostty`, or any `owner/name`), an optional ref, the number of rounds,
+a worker count, the Zig version, an optional mezura ref, whether to add a
+combined run, and toggles for per-file output (`--by-file` / `--files`) and for
+disabling ignore files on every tool. The workflow shallow-clones each
+repository, builds `kazu`, clones and builds `mezura` with
+`cargo build --release --bin mezura`, and runs all four tools with their default
+ignore-file behaviour unless the ignore toggle is enabled. With **combined**
+enabled it also scans the parent directory of every checkout as one large tree,
+which approximates a monorepo workload and exercises the walker, the worker
+pool, and per-directory ignore-file handling at scale. The Markdown report is
+written to the job summary and includes a text bar chart of peak memory per
+tool; the Markdown, JSON, and a standalone peak-memory SVG chart
+(`bench-memory.svg`) are uploaded as an artifact.
+
+The driver runs `mezura` with `--counting region`, `--count-minified`,
+`--count-generated`, `--count-not-code`, and `--search-in-dotted` so it uses
+the same cloc/tokei/scc line model and counts the files the other tools count;
+`--no-default-config --no-local` keep machine and project settings out. If you
+already built mezura locally, point the driver at its binary and skip the build.
 
 The same driver runs locally. Pass the parent directory of the checkouts as an
 extra `--repo` entry to reproduce the combined run:
@@ -218,11 +230,13 @@ extra `--repo` entry to reproduce the combined run:
 ```sh
 python3 .github/scripts/bench.py \
   --kazu ./zig-out/bin/kazu --scc scc --tokei tokei \
+  --mezura /root/mezura/target/release/mezura \
   --repo "kazu=$PWD" --rounds 7 --markdown results.md
 
 # per-repository rows plus one row that scans all checkouts at once
 python3 .github/scripts/bench.py \
   --kazu ./zig-out/bin/kazu --scc scc --tokei tokei \
+  --mezura /root/mezura/target/release/mezura \
   --repo "linux=/srv/repos/linux" \
   --repo "zig=/srv/repos/zig" \
   --repo "all-repos=/srv/repos" \
@@ -243,7 +257,7 @@ zig build test
 
 - `src/languages.zig` - language table, extension/filename/shebang detection
 - `src/count.zig` - line classification and counting
-- `src/gitignore.zig` - `.gitignore` parsing and path matching
+- `src/gitignore.zig` - `.gitignore` / `.ignore` parsing and path matching
 - `src/format.zig` - table, JSON, Markdown, HTML, and ZON renderers
 - `src/main.zig` - CLI parsing, selective `std.Io` directory walking, and batched `std.Io` workers
 - `src/root.zig` - public library module

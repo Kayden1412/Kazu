@@ -1,9 +1,9 @@
 name: Benchmark
 
-# Manually triggered comparison of kazu against scc and tokei on large
+# Manually triggered comparison of kazu against scc, tokei, and mezura on large
 # repositories. By default every tool runs with its default ignore behaviour,
 # so .gitignore files are honored and no --no-gitignore flag is passed. The
-# no_gitignore and by_file inputs switch all three tools into the matching
+# no_gitignore and by_file inputs switch all four tools into the matching
 # mode for the run.
 
 on:
@@ -36,6 +36,11 @@ on:
         required: false
         default: "0.17.0"
         type: string
+      mezura_ref:
+        description: Branch, tag, or commit SHA to check out for mezura (empty = default branch)
+        required: false
+        default: ""
+        type: string
       combined:
         description: >-
           Also scan every cloned repository as a single tree, in addition to
@@ -45,15 +50,16 @@ on:
         type: boolean
       by_file:
         description: >-
-          Ask every tool for per-file output (kazu/scc --by-file, tokei
+          Ask every tool for per-file output (kazu/scc/mezura --by-file, tokei
           --files); tokei's JSON always includes per-file reports
         required: false
         default: false
         type: boolean
       no_gitignore:
         description: >-
-          Disable ignore files for every tool (kazu --no-gitignore; scc
-          --no-gitignore --no-ignore --no-scc-ignore; tokei --no-ignore)
+          Disable ignore files for every tool (kazu --no-gitignore
+          --no-ignore; scc --no-gitignore --no-ignore --no-scc-ignore;
+          tokei --no-ignore; mezura --no-gitignore --no-ignore-files)
         required: false
         default: false
         type: boolean
@@ -67,10 +73,11 @@ concurrency:
 
 env:
   TOKEI_VERSION: "15.0.0"
+  MEZURA_REPO: "https://github.com/subamanis/mezura"
 
 jobs:
   bench:
-    name: kazu vs scc vs tokei
+    name: kazu vs scc vs tokei vs mezura
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
@@ -111,12 +118,33 @@ jobs:
           fi
           echo "$RUNNER_TEMP/tokei/bin" >> "$GITHUB_PATH"
 
+      - name: Build mezura
+        env:
+          MEZURA_REF: ${{ inputs.mezura_ref }}
+        run: |
+          set -euo pipefail
+          if [ -n "$MEZURA_REF" ]; then
+            if [[ "$MEZURA_REF" =~ ^[0-9a-f]{40}$ ]]; then
+              git init -q "$RUNNER_TEMP/mezura"
+              git -C "$RUNNER_TEMP/mezura" remote add origin "$MEZURA_REPO"
+              git -C "$RUNNER_TEMP/mezura" fetch -q --depth 1 origin "$MEZURA_REF"
+              git -C "$RUNNER_TEMP/mezura" checkout -q FETCH_HEAD
+            else
+              git clone -q --depth 1 --branch "$MEZURA_REF" "$MEZURA_REPO" "$RUNNER_TEMP/mezura"
+            fi
+          else
+            git clone -q --depth 1 "$MEZURA_REPO" "$RUNNER_TEMP/mezura"
+          fi
+          cargo build --release --bin mezura --manifest-path "$RUNNER_TEMP/mezura/Cargo.toml"
+          "$RUNNER_TEMP/mezura/target/release/mezura" --version
+
       - name: Verify tools
         run: |
           set -euo pipefail
           "$GITHUB_WORKSPACE/zig-out/bin/kazu" --version
           scc --version
           tokei --version
+          "$RUNNER_TEMP/mezura/target/release/mezura" --version
 
       - name: Clone repositories
         env:
@@ -174,7 +202,7 @@ jobs:
           done
 
           # The clone parent contains every checkout and nothing else, so it is
-          # also a valid scan root. Scanning it measures all three tools on one
+          # also a valid scan root. Scanning it measures all four tools on one
           # large tree, which is the closest match to a real monorepo workload.
           if [ "$COMBINED" = "true" ] && [ "$(wc -l < "$RUNNER_TEMP/repo-args.txt")" -ge 2 ]; then
             echo "all-repos=$RUNNER_TEMP/repos" >> "$RUNNER_TEMP/repo-args.txt"
@@ -205,6 +233,7 @@ jobs:
             --kazu "$GITHUB_WORKSPACE/zig-out/bin/kazu" \
             --scc "$(command -v scc)" \
             --tokei "$(command -v tokei)" \
+            --mezura "$RUNNER_TEMP/mezura/target/release/mezura" \
             --rounds "${{ inputs.rounds }}" \
             --workers "${{ inputs.workers }}" \
             "${modes[@]}" \

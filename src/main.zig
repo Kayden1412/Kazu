@@ -1,7 +1,7 @@
 //! kazu - fast parallel source code counter.
 //!
 //! Directory walking is sequential and uses `std.Io.Dir.walkSelectively`, so
-//! excluded and gitignored directories can be pruned before they are opened.
+//! excluded and ignored directories can be pruned before they are opened.
 //! File paths are collected in batches, and each batch is split across a group
 //! of `std.Io` workers with one atomic counter. Every file and directory
 //! operation goes through `std.Io`; its threaded backend runs the syscall
@@ -21,7 +21,7 @@ pub const std_options: std.Options = .{
 
 const version = "0.1.0";
 const max_file_size: u64 = 256 * 1024 * 1024;
-const max_gitignore_size: usize = 1024 * 1024;
+const max_ignore_size: usize = 1024 * 1024;
 /// Files are counted in chunks so a worker never allocates a buffer the size
 /// of the file.  One buffer is allocated per worker and reused for every file.
 const read_buffer_size: usize = 64 * 1024;
@@ -73,6 +73,7 @@ const help_text =
     \\      --include-ext <ext>   Only count these extensions (repeatable)
     \\      --exclude-ext <ext>   Skip these extensions (repeatable)
     \\      --no-gitignore        Do not read .gitignore files
+    \\      --no-ignore           Do not read .ignore files
     \\  -h, --help                Show this help
     \\  -v, --version             Show the version
     \\
@@ -80,7 +81,8 @@ const help_text =
     \\the file name, extension, or a #! interpreter line. Lines are classified as
     \\code, comment, or blank; mixed code/comment lines count as code.
     \\
-    \\.gitignore files are honored by default; use --no-gitignore to disable.
+    \\.gitignore and .ignore files are honored by default; use --no-gitignore or
+    \\--no-ignore to disable them individually.
     \\Binary files are skipped; symlinks are only counted with --include-symlinks.
     \\
     \\Examples:
@@ -100,6 +102,7 @@ const Config = struct {
     include_exts: []const []const u8 = &.{},
     exclude_exts: []const []const u8 = &.{},
     gitignore: bool = true,
+    ignore: bool = true,
     by_file: bool = false,
     include_symlinks: bool = false,
 };
@@ -230,6 +233,7 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8) !Action {
     var sort_value: format.SortField = .code;
     var workers: ?usize = null;
     var use_gitignore = true;
+    var use_ignore = true;
     var by_file = false;
     var include_symlinks = false;
     var show_help = false;
@@ -296,6 +300,8 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8) !Action {
             include_symlinks = true;
         } else if (std.mem.eql(u8, option.name, "--no-gitignore")) {
             use_gitignore = false;
+        } else if (std.mem.eql(u8, option.name, "--no-ignore")) {
+            use_ignore = false;
         } else {
             return invalid("unknown option '{s}'", .{arg});
         }
@@ -313,6 +319,7 @@ fn parseArgs(arena: std.mem.Allocator, args: []const []const u8) !Action {
         .include_exts = include_exts.items,
         .exclude_exts = exclude_exts.items,
         .gitignore = use_gitignore,
+        .ignore = use_ignore,
         .by_file = by_file,
         .include_symlinks = include_symlinks,
     };
@@ -633,29 +640,25 @@ fn walkDir(
     var ignores = gitignore.Set.init(gpa);
     defer ignores.deinit();
 
-    // Depth (relative to `root`) of each directory whose `.gitignore` is
+    // Depth (relative to `root`) of each directory whose ignore file is
     // currently loaded.  The root directory itself is depth 0.
     var ignore_depths: std.ArrayList(usize) = .empty;
     defer ignore_depths.deinit(gpa);
 
-    if (config.gitignore) {
-        _ = pushGitignore(
-            gpa,
-            io,
-            root,
-            ".gitignore",
-            "",
-            0,
-            root_path,
-            &ignores,
-            &ignore_depths,
-        );
-    }
+    _ = pushIgnoreFiles(
+        gpa,
+        io,
+        config,
+        root,
+        "",
+        0,
+        root_path,
+        &ignores,
+        &ignore_depths,
+    );
 
     var walker = try std.Io.Dir.walkSelectively(root, gpa);
     defer walker.deinit();
-
-    var gitignore_path_buffer: [std.fs.max_path_bytes]u8 = undefined;
 
     while (true) {
         const maybe_entry = walker.next(io) catch |err| {
@@ -681,7 +684,7 @@ fn walkDir(
 
         // The selective walker pops exhausted directories without notifying the
         // caller.  Use the depth of the entry we just received to drop any
-        // `.gitignore` files that no longer apply.
+        // ignore files that no longer apply.
         while (ignore_depths.items.len > 0 and
             ignore_depths.items[ignore_depths.items.len - 1] >= depth)
         {
@@ -696,30 +699,22 @@ fn walkDir(
                 if (isExcludedDir(config, entry.basename)) continue;
                 if (ignores.isIgnored(entry.path, true)) continue;
 
-                var pushed_ignore = false;
-                if (config.gitignore) {
-                    const sub_path = std.fmt.bufPrint(
-                        &gitignore_path_buffer,
-                        "{s}/.gitignore",
-                        .{entry.basename},
-                    ) catch null;
-                    if (sub_path) |name| {
-                        pushed_ignore = pushGitignore(
-                            gpa,
-                            io,
-                            entry.dir,
-                            name,
-                            entry.path,
-                            depth,
-                            entry.path,
-                            &ignores,
-                            &ignore_depths,
-                        );
-                    }
-                }
+                var pushed_ignore: usize = 0;
+                pushed_ignore = pushIgnoreFiles(
+                    gpa,
+                    io,
+                    config,
+                    entry.dir,
+                    entry.basename,
+                    depth,
+                    entry.path,
+                    &ignores,
+                    &ignore_depths,
+                );
 
                 walker.enter(io, effective) catch |err| {
-                    if (pushed_ignore) {
+                    var remaining = pushed_ignore;
+                    while (remaining > 0) : (remaining -= 1) {
                         _ = ignore_depths.pop();
                         ignores.pop();
                     }
@@ -773,24 +768,72 @@ fn walkDir(
     }
 }
 
-/// Load `<dir>/<sub_path>` into `ignores`, remembering its depth so it can be
-/// popped when the walk returns to an ancestor.  Returns true when a file was
-/// added.  Missing, unreadable, oversized, empty or invalid files are ignored.
-fn pushGitignore(
+/// Load the ignore files in one directory: `.gitignore` first, then `.ignore`,
+/// so `.ignore` rules win when both match.  Each loaded file is recorded at
+/// `depth` so it can be popped when the walk returns to an ancestor.  Returns
+/// the number of files added.
+fn pushIgnoreFiles(
     gpa: std.mem.Allocator,
     io: std.Io,
+    config: *const Config,
     dir: std.Io.Dir,
-    sub_path: []const u8,
     base: []const u8,
     depth: usize,
     log_path: []const u8,
     ignores: *gitignore.Set,
     ignore_depths: *std.ArrayList(usize),
+) usize {
+    var pushed: usize = 0;
+    if (config.gitignore and pushIgnoreFile(
+        gpa,
+        io,
+        dir,
+        base,
+        ".gitignore",
+        depth,
+        log_path,
+        ignores,
+        ignore_depths,
+    )) pushed += 1;
+    if (config.ignore and pushIgnoreFile(
+        gpa,
+        io,
+        dir,
+        base,
+        ".ignore",
+        depth,
+        log_path,
+        ignores,
+        ignore_depths,
+    )) pushed += 1;
+    return pushed;
+}
+
+/// Load `<dir>/<base>/<name>` into `ignores`, remembering its depth so it can
+/// be popped when the walk returns to an ancestor.  Returns true when a file
+/// was added.  Missing, unreadable, oversized, empty or invalid files are
+/// ignored.
+fn pushIgnoreFile(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    dir: std.Io.Dir,
+    base: []const u8,
+    name: []const u8,
+    depth: usize,
+    log_path: []const u8,
+    ignores: *gitignore.Set,
+    ignore_depths: *std.ArrayList(usize),
 ) bool {
-    const contents = readGitignore(gpa, io, dir, sub_path) orelse return false;
+    var path_buffer: [std.fs.max_path_bytes]u8 = undefined;
+    const sub_path = if (base.len == 0)
+        name
+    else
+        std.fmt.bufPrint(&path_buffer, "{s}/{s}", .{ base, name }) catch return false;
+
+    const contents = readIgnoreFile(gpa, io, dir, sub_path) orelse return false;
 
     ignores.addOwned(base, contents) catch |err| {
-        std.log.debug("kazu: cannot parse .gitignore in {s}: {}", .{ log_path, err });
+        std.log.debug("kazu: cannot parse {s} in {s}: {}", .{ name, log_path, err });
         return false;
     };
     ignore_depths.append(gpa, depth) catch {
@@ -800,9 +843,9 @@ fn pushGitignore(
     return true;
 }
 
-/// Read `.gitignore` from `dir`.  Missing, unreadable, oversized or empty
+/// Read an ignore file from `dir`.  Missing, unreadable, oversized or empty
 /// files simply produce null.
-fn readGitignore(
+fn readIgnoreFile(
     gpa: std.mem.Allocator,
     io: std.Io,
     dir: std.Io.Dir,
@@ -820,7 +863,7 @@ fn readGitignore(
     while (true) {
         const read_len = file.readPositional(io, &.{buffer[0..]}, offset) catch return null;
         if (read_len == 0) break;
-        if (contents.items.len + read_len > max_gitignore_size) return null;
+        if (contents.items.len + read_len > max_ignore_size) return null;
         contents.appendSlice(gpa, buffer[0..read_len]) catch return null;
         offset += @intCast(read_len);
     }
@@ -929,7 +972,7 @@ fn canHaveShebang(name: []const u8) bool {
     return std.fs.path.extension(std.fs.path.basename(name)).len == 0;
 }
 
-test "gitignore is enabled by default and can be disabled" {
+test "gitignore and ignore are enabled by default and can be disabled" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const allocator = arena.allocator();
@@ -940,13 +983,23 @@ test "gitignore is enabled by default and can be disabled" {
         else => unreachable,
     };
     try std.testing.expect(default_config.gitignore);
+    try std.testing.expect(default_config.ignore);
 
-    const disabled_action = try parseArgs(allocator, &.{ "kazu", "--no-gitignore", "." });
-    const disabled_config = switch (disabled_action) {
+    const no_gitignore_action = try parseArgs(allocator, &.{ "kazu", "--no-gitignore", "." });
+    const no_gitignore_config = switch (no_gitignore_action) {
         .run => |config| config,
         else => unreachable,
     };
-    try std.testing.expect(!disabled_config.gitignore);
+    try std.testing.expect(!no_gitignore_config.gitignore);
+    try std.testing.expect(no_gitignore_config.ignore);
+
+    const no_ignore_action = try parseArgs(allocator, &.{ "kazu", "--no-ignore", "." });
+    const no_ignore_config = switch (no_ignore_action) {
+        .run => |config| config,
+        else => unreachable,
+    };
+    try std.testing.expect(no_ignore_config.gitignore);
+    try std.testing.expect(!no_ignore_config.ignore);
 }
 
 test "gitignore and ignore files are read but not counted" {
@@ -956,6 +1009,169 @@ test "gitignore and ignore files are read but not counted" {
     try std.testing.expect(!isIncludedFile(&config, ".ignore"));
     try std.testing.expect(isIncludedFile(&config, ".dockerignore"));
     try std.testing.expect(isIncludedFile(&config, "main.zig"));
+}
+
+/// Result of walking a temporary fixture in per-file mode.
+const WalkFixture = struct {
+    files: std.ArrayList(format.FileSummary),
+    stats: []format.Summary,
+
+    fn deinit(self: *WalkFixture, gpa: std.mem.Allocator) void {
+        for (self.files.items) |file| gpa.free(file.path);
+        self.files.deinit(gpa);
+        gpa.free(self.stats);
+    }
+
+    fn has(self: *const WalkFixture, name: []const u8) bool {
+        for (self.files.items) |file| {
+            if (std.mem.eql(u8, std.fs.path.basename(file.path), name)) return true;
+        }
+        return false;
+    }
+};
+
+/// Walk a `std.testing.tmpDir` fixture through the real walker and batcher so
+/// ignore-file handling is exercised end to end.
+fn walkFixture(
+    io: std.Io,
+    gpa: std.mem.Allocator,
+    config: Config,
+    root_path: []const u8,
+    root: std.Io.Dir,
+) !WalkFixture {
+    const stats = try gpa.alloc(format.Summary, languages.languages.len);
+    for (stats, 0..) |*stat, index| stat.* = .{ .lang = @intCast(index) };
+
+    var files: std.ArrayList(format.FileSummary) = .empty;
+    var batcher = Batcher{
+        .gpa = gpa,
+        .io = io,
+        .workers = 1,
+        .stats = stats,
+        .files = &files,
+    };
+    defer batcher.deinit();
+
+    var mutable = config;
+    try walkDir(io, gpa, &mutable, root_path, root, null, &batcher);
+    try batcher.flush();
+    return .{ .files = files, .stats = stats };
+}
+
+fn fixtureRootPath(gpa: std.mem.Allocator, tmp: *const std.testing.TmpDir) ![]u8 {
+    return std.fmt.allocPrint(gpa, ".zig-cache/tmp/{s}", .{tmp.sub_path[0..]});
+}
+
+test ".ignore rules are honored and the file is not counted" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ignore", .data = "*.c\n!keep.c\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep.c", .data = "int keep;\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "other.c", .data = "int other;\n" });
+
+    const root_path = try fixtureRootPath(gpa, &tmp);
+    defer gpa.free(root_path);
+
+    var result = try walkFixture(io, gpa, .{ .workers = 1 }, root_path, tmp.dir);
+    defer result.deinit(gpa);
+
+    try std.testing.expect(result.has("keep.c"));
+    try std.testing.expect(!result.has("other.c"));
+    try std.testing.expectEqual(@as(usize, 1), result.files.items.len);
+}
+
+test ".ignore overrides .gitignore and nested rules override parents" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.c\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ignore", .data = "!keep.c\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep.c", .data = "int keep;\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "other.c", .data = "int other;\n" });
+
+    try tmp.dir.createDirPath(io, "sub");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sub/.ignore", .data = "!a.c\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "sub/a.c", .data = "int a;\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "sub/b.c", .data = "int b;\n" });
+
+    const root_path = try fixtureRootPath(gpa, &tmp);
+    defer gpa.free(root_path);
+
+    var result = try walkFixture(io, gpa, .{ .workers = 1 }, root_path, tmp.dir);
+    defer result.deinit(gpa);
+
+    try std.testing.expect(result.has("keep.c"));
+    try std.testing.expect(!result.has("other.c"));
+    try std.testing.expect(result.has("a.c"));
+    try std.testing.expect(!result.has("b.c"));
+    try std.testing.expectEqual(@as(usize, 2), result.files.items.len);
+}
+
+test "--no-ignore keeps .gitignore active" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.c\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ignore", .data = "!keep.c\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep.c", .data = "int keep;\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "other.c", .data = "int other;\n" });
+
+    const root_path = try fixtureRootPath(gpa, &tmp);
+    defer gpa.free(root_path);
+
+    var enabled = try walkFixture(io, gpa, .{ .workers = 1 }, root_path, tmp.dir);
+    defer enabled.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), enabled.files.items.len);
+    try std.testing.expect(enabled.has("keep.c"));
+
+    var disabled = try walkFixture(
+        io,
+        gpa,
+        .{ .workers = 1, .ignore = false },
+        root_path,
+        tmp.dir,
+    );
+    defer disabled.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), disabled.files.items.len);
+}
+
+test "--no-gitignore keeps .ignore active" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = ".gitignore", .data = "*.c\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".ignore", .data = "skip.c\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "keep.c", .data = "int keep;\n" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "skip.c", .data = "int skip;\n" });
+
+    const root_path = try fixtureRootPath(gpa, &tmp);
+    defer gpa.free(root_path);
+
+    var result = try walkFixture(
+        io,
+        gpa,
+        .{ .workers = 1, .gitignore = false },
+        root_path,
+        tmp.dir,
+    );
+    defer result.deinit(gpa);
+
+    try std.testing.expect(result.has("keep.c"));
+    try std.testing.expect(!result.has("skip.c"));
+    try std.testing.expectEqual(@as(usize, 1), result.files.items.len);
 }
 
 test "default lockfiles are not counted" {

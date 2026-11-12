@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interleaved benchmark driver comparing kazu, scc, and tokei.
+"""Interleaved benchmark driver comparing kazu, scc, tokei, and mezura.
 
 Every tool is executed directly with ``fork``/``exec`` so the measured wall
 clock includes process startup but not a shell. Each round runs the tools in a
@@ -76,7 +76,7 @@ def kazu_command(executable: str, path: str, workers: int, options: Options) -> 
     if options.by_file:
         argv.append("--by-file")
     if options.no_gitignore:
-        argv.append("--no-gitignore")
+        argv += ["--no-gitignore", "--no-ignore"]
     return argv + [path]
 
 
@@ -100,6 +100,35 @@ def tokei_command(executable: str, path: str, options: Options) -> list[str]:
     if options.no_gitignore:
         argv.append("--no-ignore")
     return argv + [path]
+
+
+def mezura_command(executable: str, path: str, options: Options) -> list[str]:
+    # mezura defaults to a content-based model and drops minified, generated,
+    # and non-code files while skipping dotted directories. None of the other
+    # tools do that, so switch to the cloc/tokei/scc region model and count
+    # those files. --no-default-config/--no-local keep machine and project
+    # settings out, and --hide keywords/tests drops the extra dimensions the
+    # other tools do not report.
+    argv = [
+        executable,
+        path,
+        "--output", "json",
+        "--counting", "region",
+        "--count-minified",
+        "--count-generated",
+        "--count-not-code",
+        "--search-in-dotted",
+        "--no-default-config",
+        "--no-local",
+        "--hide", "keywords,tests",
+    ]
+    if options.by_file:
+        argv.append("--by-file")
+    if options.no_gitignore:
+        # mezura splits .gitignore from .ignore/.rgignore, so both flags are
+        # needed to match the other tools' full ignore-file disable.
+        argv += ["--no-gitignore", "--no-ignore-files"]
+    return argv
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +281,22 @@ def parse_tokei(raw: bytes) -> dict[str, int]:
     return counts
 
 
+def parse_mezura(raw: bytes) -> dict[str, int]:
+    counts = _empty_counts()
+    data = json.loads(raw or b"{}")
+
+    total = data.get("total")
+    if isinstance(total, dict):
+        counts["files"] = int(total.get("files", 0))
+        counts["lines"] = int(total.get("lines", 0))
+        counts["code"] = int(total.get("code", 0))
+        counts["comments"] = int(total.get("comments", 0))
+        # The region model reports blank lines; the content model calls the
+        # third column "extra".
+        counts["blanks"] = int(total.get("blanks", total.get("extra", 0)))
+    return counts
+
+
 # ---------------------------------------------------------------------------
 # Aggregation and rendering
 # ---------------------------------------------------------------------------
@@ -322,18 +367,19 @@ def render_markdown(
 ) -> str:
     worker_label = "default (CPU count)" if workers <= 0 else str(workers)
     ignore_label = (
-        "disabled by every tool (`--no-gitignore`, plus `--no-ignore` and "
-        "`--no-scc-ignore` for scc)"
+        "disabled by every tool (`--no-gitignore --no-ignore` for kazu, "
+        "`--no-gitignore --no-ignore --no-scc-ignore` for scc, "
+        "`--no-ignore` for tokei, `--no-gitignore --no-ignore-files` for mezura)"
         if options.no_gitignore
         else "honored by every tool (no `--no-gitignore`)"
     )
     by_file_label = (
-        "on (kazu/scc `--by-file`, tokei `--files`)"
+        "on (kazu/scc/mezura `--by-file`, tokei `--files`)"
         if options.by_file
         else "off (per-language totals)"
     )
     lines: list[str] = [
-        "# kazu vs scc vs tokei",
+        "# kazu vs scc vs tokei vs mezura",
         "",
         f"- **Generated:** {generated_at}",
         f"- **Rounds:** {rounds} (interleaved; run order alternates each round)",
@@ -492,6 +538,7 @@ _TOOL_COLORS = {
     "kazu": "#2f81f7",
     "scc": "#f0883e",
     "tokei": "#3fb950",
+    "mezura": "#a371f7",
 }
 
 
@@ -615,6 +662,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--kazu", default="kazu", help="path to the kazu binary")
     parser.add_argument("--scc", default="scc", help="path to the scc binary")
     parser.add_argument("--tokei", default="tokei", help="path to the tokei binary")
+    parser.add_argument("--mezura", default="mezura", help="path to the mezura binary")
     parser.add_argument(
         "--repo",
         action="append",
@@ -632,14 +680,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--by-file",
         action="store_true",
-        help="ask every tool for per-file output (kazu/scc --by-file, tokei --files)",
+        help="ask every tool for per-file output (kazu/scc/mezura --by-file, tokei --files)",
     )
     parser.add_argument(
         "--no-gitignore",
         action="store_true",
         help=(
-            "disable ignore files for every tool (kazu --no-gitignore; "
-            "scc --no-gitignore --no-ignore --no-scc-ignore; tokei --no-ignore)"
+            "disable ignore files for every tool (kazu --no-gitignore "
+            "--no-ignore; scc --no-gitignore --no-ignore --no-scc-ignore; "
+            "tokei --no-ignore; mezura --no-gitignore --no-ignore-files)"
         ),
     )
     parser.add_argument("--timeout", type=float, default=1800.0, help="per-run timeout in seconds")
@@ -680,8 +729,13 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     options = Options(by_file=args.by_file, no_gitignore=args.no_gitignore)
 
-    tool_paths = {"kazu": args.kazu, "scc": args.scc, "tokei": args.tokei}
-    tools = [name for name in ("kazu", "scc", "tokei") if tool_paths[name]]
+    tool_paths = {
+        "kazu": args.kazu,
+        "scc": args.scc,
+        "tokei": args.tokei,
+        "mezura": args.mezura,
+    }
+    tools = [name for name in ("kazu", "scc", "tokei", "mezura") if tool_paths[name]]
     versions = {name: tool_version(tool_paths[name]) for name in tools}
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -709,6 +763,7 @@ def main(argv: list[str]) -> int:
             "kazu": kazu_command(tool_paths["kazu"], path, args.workers, options),
             "scc": scc_command(tool_paths["scc"], path, options),
             "tokei": tokei_command(tool_paths["tokei"], path, options),
+            "mezura": mezura_command(tool_paths["mezura"], path, options),
         }
 
         for name in tools:
@@ -723,6 +778,7 @@ def main(argv: list[str]) -> int:
                     "kazu": parse_kazu,
                     "scc": parse_scc,
                     "tokei": parse_tokei,
+                    "mezura": parse_mezura,
                 }[name](run_capture(argv, args.timeout))
             except (BenchError, OSError, json.JSONDecodeError) as err:
                 result.error = str(err)

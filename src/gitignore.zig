@@ -1,12 +1,14 @@
-//! `.gitignore` parsing and matching.
+//! gitignore-format parsing and matching.
 //!
-//! This implements the parts of gitignore syntax that matter while walking a
-//! source tree: comments, negation, anchored patterns, directory-only
-//! patterns, `*`, `?`, character classes and `**`.
+//! Used for `.gitignore` and `.ignore` files.  This implements the parts of
+//! gitignore syntax that matter while walking a source tree: comments,
+//! negation, anchored patterns, directory-only patterns, `*`, `?`, character
+//! classes and `**`.
 //!
 //! Patterns are evaluated in order and the last matching pattern wins.  A
-//! nested `.gitignore` is appended after its parent, so rules in deeper files
-//! override rules from shallower ones.
+//! nested file is appended after its parent, so rules in deeper files override
+//! rules from shallower ones.  When a directory has both files, `.ignore` is
+//! loaded after `.gitignore`, so its rules take precedence.
 
 const std = @import("std");
 
@@ -20,7 +22,7 @@ pub const Pattern = struct {
 };
 
 pub const File = struct {
-    /// Directory containing this `.gitignore`, relative to the scan root.
+    /// Directory containing this ignore file, relative to the scan root.
     /// Empty for the root itself. Uses `/` separators.
     base: []const u8,
     patterns: []const Pattern,
@@ -40,13 +42,13 @@ pub const Set = struct {
         self.files.deinit(self.allocator);
     }
 
-    /// Add a `.gitignore` file by copying its contents.
+    /// Add an ignore file by copying its contents.
     pub fn add(self: *Set, base: []const u8, contents: []const u8) !void {
         const owned = try self.allocator.dupe(u8, contents);
         try self.addOwned(base, owned);
     }
 
-    /// Add a `.gitignore` file, taking ownership of `contents`.
+    /// Add an ignore file, taking ownership of `contents`.
     ///
     /// `contents` must have been allocated with `self.allocator`.  On error it
     /// is freed before returning.
@@ -76,7 +78,7 @@ pub const Set = struct {
         });
     }
 
-    /// Remove the most recently added `.gitignore`.
+    /// Remove the most recently added ignore file.
     pub fn pop(self: *Set) void {
         if (self.files.items.len == 0) return;
 

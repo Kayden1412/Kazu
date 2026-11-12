@@ -36,14 +36,14 @@ validate library changes. Host-specific notes live in `ENVIRONMENT.local.md`
 
 | File | Responsibility |
 | --- | --- |
-| `src/main.zig` | CLI parsing, selective `std.Io` directory walk, `.gitignore` integration, batched `std.Io` workers |
+| `src/main.zig` | CLI parsing, selective `std.Io` directory walk, `.gitignore` / `.ignore` integration, batched `std.Io` workers |
 | `src/root.zig` | Public module; re-exports the pure modules and pulls in their tests |
 | `src/languages.zig` | Language table plus filename/extension/shebang detection |
 | `src/count.zig` | Line classification and counting |
-| `src/gitignore.zig` | `.gitignore` parser and path matcher |
+| `src/gitignore.zig` | `.gitignore` / `.ignore` parser and path matcher |
 | `src/format.zig` | Table, JSON, Markdown, HTML, and ZON renderers |
 | `README.md` | User-facing docs: flags, output formats, counting rules |
-| `.github/workflows/bench.yml` | Manual benchmark workflow: `kazu` vs `scc` vs `tokei` |
+| `.github/workflows/bench.yml` | Manual benchmark workflow: `kazu` vs `scc` vs `tokei` vs `mezura` |
 | `.github/scripts/bench.py` | Interleaved benchmark driver used by the workflow |
 
 ## Data flow
@@ -51,9 +51,10 @@ validate library changes. Host-specific notes live in `ENVIRONMENT.local.md`
 1. `walkRoot` stats each CLI path, opens a directory handle, and hands it to
    `walkDir`.
 2. `walkDir` drives `std.Io.Dir.walkSelectively`. It prunes excluded and
-   gitignored directories *before* calling `enter`, so skipped trees are never
-   opened, and loads each directory's `.gitignore` as it descends. Entries
-   carry a root-relative path; the walker owns the directory handles.
+   ignored directories *before* calling `enter`, so skipped trees are never
+   opened, and loads each directory's `.gitignore` then `.ignore` as it
+   descends. Entries carry a root-relative path; the walker owns the directory
+   handles.
 3. `queueFile` applies `--include-ext` / `--exclude-ext`, detects the language
    from the basename, and appends a `FileTask` to the current batch. It takes
    ownership of the path string; the batch frees it. It returns whether the
@@ -159,8 +160,8 @@ These match `scc`/`cloc`. Any change needs a corresponding test.
 `scc` 4.1.0 is installed. Use these flags so the comparison is apples-to-apples:
 
 ```sh
-scc --no-complexity --no-cocomo --no-gitignore --format json <path>
-./zig-out/bin/kazu --no-gitignore --format json <path>
+scc --no-complexity --no-cocomo --no-gitignore --no-ignore --no-scc-ignore --format json <path>
+./zig-out/bin/kazu --no-gitignore --no-ignore --format json <path>
 ```
 
 `kazu` emits `Name`/`Files`; `scc` emits `Name`/`Count`. Known, accepted
@@ -188,22 +189,30 @@ Single-shot timings are meaningless on a shared host.
   for far less memory.
 - Standard workloads: `src`, `/root/LangArena` (source-only and full), a flat
   source tree, a large single file, and synthetic dir-heavy trees. Use
-  `--no-gitignore` on both tools.
+  `--no-gitignore --no-ignore` on kazu and
+  `--no-gitignore --no-ignore --no-scc-ignore` on scc.
 - Record results in `BENCHMARKS.md`. That file also holds the `scc` 4.1.0
   comparison and the scanner/read-buffer baselines; refresh it after changing
   the scanner, the I/O path, or the worker pool.
 - `.github/workflows/bench.yml` is the repeatable cross-tool comparison. It is
   `workflow_dispatch`-only, shallow-clones the requested repositories, and runs
-  all three tools with their default ignore behaviour (no `--no-gitignore`)
+  all four tools with their default ignore behaviour (no `--no-gitignore`)
   unless the `no_gitignore` input is enabled, which adds
-  `--no-gitignore --no-ignore --no-scc-ignore` for scc and `--no-ignore` for
-  tokei. The `by_file` input switches all
-  three tools to per-file output (`--by-file` for kazu/scc, `--files` for
-  tokei; tokei's JSON always includes per-file reports). The `combined` input
-  adds one scan of the clone parent, so the tools are also measured on a single
-  large tree. `bench.py --svg` writes a grouped peak-RSS bar chart; the
-  workflow attaches it as `bench-memory.svg` and also renders a text bar chart
-  in the Markdown report (GitHub strips inline SVG from Markdown).
+  `--no-gitignore --no-ignore` for kazu,
+  `--no-gitignore --no-ignore --no-scc-ignore` for scc, `--no-ignore` for
+  tokei, and `--no-gitignore --no-ignore-files` for mezura. The `by_file` input
+  switches all four tools to per-file output (`--by-file` for kazu/scc/mezura,
+  `--files` for tokei; tokei's JSON always includes per-file reports). The
+  workflow builds mezura from source with
+  `cargo build --release --bin mezura`; locally, point `--mezura` at an
+  existing binary instead. The driver runs mezura with `--counting region`,
+  `--count-minified`, `--count-generated`, `--count-not-code`, and
+  `--search-in-dotted` so it uses the same line model and file set as the other
+  tools. The `combined` input adds one scan of the clone parent, so the tools
+  are also measured on a single large tree. `bench.py --svg` writes a grouped
+  peak-RSS bar chart; the workflow attaches it as `bench-memory.svg` and also
+  renders a text bar chart in the Markdown report (GitHub strips inline SVG
+  from Markdown).
 
 ## Gotchas
 
@@ -224,8 +233,8 @@ Single-shot timings are meaningless on a shared host.
 - Lockfiles matching `scc`'s default `--exclude-file` list are skipped
   (`package-lock.json`, `Cargo.lock`, `yarn.lock`, `pubspec.lock`,
   `Podfile.lock`, `pnpm-lock.yaml`). The match is a substring of the basename.
-- Files over 256 MiB are skipped with a warning; `.gitignore` files over 1 MiB
-  are ignored.
+- Files over 256 MiB are skipped with a warning; ignore files over 1 MiB are
+  ignored.
 - `--include-ext` filters on the file extension, so extensionless files (which
   rely on shebang detection) are excluded when it is set.
 - `--exclude-dir` matches directory names, not paths, and defaults already
@@ -242,8 +251,9 @@ Single-shot timings are meaningless on a shared host.
   enough to amortize that; do not flush per directory.
 - The walk must stay on `std.Io.Dir.walkSelectively`, not a recursive helper.
   `enter` is what descends, so an excluded or ignored directory is pruned with
-  a single readdir entry and never opened. `.gitignore` scope is tracked by
+  a single readdir entry and never opened. Ignore-file scope is tracked by
   entry depth because the walker pops exhausted directories internally without
-  a callback.
+  a callback. `.ignore` is loaded after `.gitignore` in the same directory so
+  its rules win.
 - The `README.md` "Layout" and flag table must stay in sync with `help_text` in
   `src/main.zig` and the option parsing.
