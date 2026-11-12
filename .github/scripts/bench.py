@@ -366,20 +366,38 @@ def render_markdown(
     svg_name: str | None = None,
 ) -> str:
     worker_label = "default (CPU count)" if workers <= 0 else str(workers)
+    ignore_flags = {
+        "kazu": "`--no-gitignore --no-ignore`",
+        "kazu-base": "`--no-gitignore --no-ignore`",
+        "scc": "`--no-gitignore --no-ignore --no-scc-ignore`",
+        "tokei": "`--no-ignore`",
+        "mezura": "`--no-gitignore --no-ignore-files`",
+    }
     ignore_label = (
-        "disabled by every tool (`--no-gitignore --no-ignore` for kazu, "
-        "`--no-gitignore --no-ignore --no-scc-ignore` for scc, "
-        "`--no-ignore` for tokei, `--no-gitignore --no-ignore-files` for mezura)"
+        "disabled by every tool ("
+        + ", ".join(
+            f"{name} {ignore_flags[name]}" for name in tools if name in ignore_flags
+        )
+        + ")"
         if options.no_gitignore
         else "honored by every tool (no `--no-gitignore`)"
     )
+    by_file_parts = []
+    by_file_tools = [
+        name for name in tools if name in ("kazu", "kazu-base", "scc", "mezura")
+    ]
+    if by_file_tools:
+        by_file_parts.append("/".join(by_file_tools) + " `--by-file`")
+    if "tokei" in tools:
+        by_file_parts.append("tokei `--files`")
     by_file_label = (
-        "on (kazu/scc/mezura `--by-file`, tokei `--files`)"
-        if options.by_file
+        "on (" + ", ".join(by_file_parts) + ")"
+        if options.by_file and by_file_parts
         else "off (per-language totals)"
     )
+    title = " vs ".join(tools) if tools else "benchmark"
     lines: list[str] = [
-        "# kazu vs scc vs tokei vs mezura",
+        f"# {title}",
         "",
         f"- **Generated:** {generated_at}",
         f"- **Rounds:** {rounds} (interleaved; run order alternates each round)",
@@ -536,6 +554,7 @@ def render_markdown(
 
 _TOOL_COLORS = {
     "kazu": "#2f81f7",
+    "kazu-base": "#d29922",
     "scc": "#f0883e",
     "tokei": "#3fb950",
     "mezura": "#a371f7",
@@ -660,6 +679,11 @@ def render_memory_svg(repos: list[dict[str, Any]], tools: list[str]) -> str:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--kazu", default="kazu", help="path to the kazu binary")
+    parser.add_argument(
+        "--kazu-base",
+        default="",
+        help="path to a baseline kazu binary to compare against --kazu",
+    )
     parser.add_argument("--scc", default="scc", help="path to the scc binary")
     parser.add_argument("--tokei", default="tokei", help="path to the tokei binary")
     parser.add_argument("--mezura", default="mezura", help="path to the mezura binary")
@@ -731,11 +755,16 @@ def main(argv: list[str]) -> int:
 
     tool_paths = {
         "kazu": args.kazu,
+        "kazu-base": args.kazu_base,
         "scc": args.scc,
         "tokei": args.tokei,
         "mezura": args.mezura,
     }
-    tools = [name for name in ("kazu", "scc", "tokei", "mezura") if tool_paths[name]]
+    tools = [
+        name
+        for name in ("kazu", "kazu-base", "scc", "tokei", "mezura")
+        if tool_paths[name]
+    ]
     versions = {name: tool_version(tool_paths[name]) for name in tools}
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
@@ -761,31 +790,54 @@ def main(argv: list[str]) -> int:
 
         commands = {
             "kazu": kazu_command(tool_paths["kazu"], path, args.workers, options),
+            "kazu-base": kazu_command(tool_paths["kazu-base"], path, args.workers, options),
             "scc": scc_command(tool_paths["scc"], path, options),
             "tokei": tokei_command(tool_paths["tokei"], path, options),
             "mezura": mezura_command(tool_paths["mezura"], path, options),
         }
 
+        parsers = {
+            "kazu": parse_kazu,
+            "kazu-base": parse_kazu,
+            "scc": parse_scc,
+            "tokei": parse_tokei,
+            "mezura": parse_mezura,
+        }
+
+        results_by_tool: dict[str, ToolResult] = {}
         for name in tools:
-            argv = commands[name]
             result = ToolResult(name=name)
+            results_by_tool[name] = result
             try:
                 # Warm the page cache and confirm the tool runs before timing.
-                run_timed(argv, args.timeout)
-                for _ in range(args.rounds):
-                    result.runs.append(run_timed(argv, args.timeout))
-                result.counts = {
-                    "kazu": parse_kazu,
-                    "scc": parse_scc,
-                    "tokei": parse_tokei,
-                    "mezura": parse_mezura,
-                }[name](run_capture(argv, args.timeout))
-            except (BenchError, OSError, json.JSONDecodeError) as err:
+                run_timed(commands[name], args.timeout)
+            except (BenchError, OSError) as err:
                 result.error = str(err)
+
+        for round_index in range(args.rounds):
+            order = tools if round_index % 2 == 0 else list(reversed(tools))
+            for name in order:
+                result = results_by_tool[name]
+                if result.error:
+                    continue
+                try:
+                    result.runs.append(run_timed(commands[name], args.timeout))
+                except (BenchError, OSError) as err:
+                    result.error = str(err)
+
+        for name in tools:
+            result = results_by_tool[name]
+            if not result.error:
+                try:
+                    result.counts = parsers[name](
+                        run_capture(commands[name], args.timeout)
+                    )
+                except (BenchError, OSError, json.JSONDecodeError) as err:
+                    result.error = str(err)
             repo["tools"][name] = tool_summary(result)
             if result.error:
                 print(f"   {name}: FAILED {result.error}", file=sys.stderr)
-            else:
+            elif result.runs:
                 wall = repo["tools"][name]["wall_ms"]["median"]
                 print(f"   {name}: {fmt_duration(wall)}", file=sys.stderr)
 

@@ -213,6 +213,14 @@ Single-shot timings are meaningless on a shared host.
   `bench.py --svg` writes a grouped peak-RSS bar chart; the workflow attaches
   it as `bench-memory.svg` and also renders a text bar chart in the Markdown
   report (GitHub strips inline SVG from Markdown).
+- `.github/workflows/bench-compare.yml` is the head-vs-base comparison for
+  `kazu` alone. It accepts the same repository/round/worker/toggle inputs plus
+  `base_ref` (default `HEAD^`), builds the head and a detached-worktree build of
+  the base with the same Zig version, and passes both binaries to `bench.py` via
+  `--kazu` and `--kazu-base`. The driver interleaves the selected tools each
+  round (forward, then reversed) and derives the report title from the tool
+  list, so a two-binary run reports `# kazu vs kazu-base`. `--kazu-base` is
+  empty by default, so the cross-tool workflow is unchanged.
 
 ## Gotchas
 

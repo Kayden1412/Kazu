@@ -1,0 +1,244 @@
+name: Benchmark compare
+
+# Manually triggered comparison of the current kazu commit against an older
+# one. Both binaries are built from the same Zig toolchain and timed
+# interleaved on the repositories named in `repos`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      repos:
+        description: >-
+          Space-separated repositories. Short names (linux, zig, go, rust,
+          ghostty) or explicit owner/name pairs.
+        required: false
+        default: linux zig go rust ghostty
+        type: string
+      ref:
+        description: Branch, tag, or commit SHA to check out for every benchmark repository (empty = default branch)
+        required: false
+        default: ""
+        type: string
+      base_ref:
+        description: >-
+          Commit, tag, branch, or relative ref to compare against
+          (empty = the previous commit, HEAD^)
+        required: false
+        default: ""
+        type: string
+      rounds:
+        description: Timed rounds per binary per repository
+        required: false
+        default: 7
+        type: number
+      workers:
+        description: kazu worker count (0 = CPU count)
+        required: false
+        default: 0
+        type: number
+      zig_version:
+        description: Zig version used to build both binaries
+        required: false
+        default: "0.17.1"
+        type: string
+      combined:
+        description: >-
+          Also scan every cloned repository as a single tree, in addition to
+          the per-repository runs
+        required: false
+        default: true
+        type: boolean
+      by_file:
+        description: Ask both binaries for per-file output (--by-file)
+        required: false
+        default: false
+        type: boolean
+      no_gitignore:
+        description: >-
+          Disable ignore files for both binaries
+          (--no-gitignore --no-ignore)
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bench-compare-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  bench:
+    name: kazu head vs base
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+
+    steps:
+      - name: Check out kazu
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: ${{ inputs.zig_version }}
+
+      - name: Build head kazu
+        run: |
+          set -euo pipefail
+          zig version
+          zig build -Doptimize=fast
+          mkdir -p "$RUNNER_TEMP/kazu-head"
+          cp zig-out/bin/kazu "$RUNNER_TEMP/kazu-head/kazu"
+          "$RUNNER_TEMP/kazu-head/kazu" --version
+
+      - name: Build base kazu
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+        run: |
+          set -euo pipefail
+          if [ -z "$BASE_REF" ]; then
+            BASE_REF="HEAD^"
+          fi
+          if ! BASE_SHA="$(git rev-parse --verify "${BASE_REF}^{commit}" 2>/dev/null)"; then
+            git fetch -q origin "$BASE_REF"
+            BASE_SHA="$(git rev-parse --verify "FETCH_HEAD^{commit}")"
+          fi
+          echo "$BASE_SHA" > "$RUNNER_TEMP/base-sha.txt"
+          echo "base commit: $BASE_SHA ($(git log -1 --format=%s "$BASE_SHA"))"
+          git worktree add --detach "$RUNNER_TEMP/kazu-base-src" "$BASE_SHA"
+          cd "$RUNNER_TEMP/kazu-base-src"
+          zig build -Doptimize=fast
+          mkdir -p "$RUNNER_TEMP/kazu-base"
+          cp zig-out/bin/kazu "$RUNNER_TEMP/kazu-base/kazu"
+          "$RUNNER_TEMP/kazu-base/kazu" --version
+
+      - name: Clone repositories
+        env:
+          REPOS: ${{ inputs.repos }}
+          REF: ${{ inputs.ref }}
+          COMBINED: ${{ inputs.combined }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/repos"
+          : > "$RUNNER_TEMP/repo-args.txt"
+
+          declare -A aliases=(
+            [linux]=torvalds/linux
+            [zig]=ziglang/zig
+            [ziglang]=ziglang/zig
+            [go]=golang/go
+            [rust]=rust-lang/rust
+            [ghostty]=ghostty-org/ghostty
+            [scc]=boyter/scc
+            [tokei]=XAMPPRocky/tokei
+          )
+
+          read -ra requested <<< "${REPOS//,/ }"
+          if [ "${#requested[@]}" -eq 0 ]; then
+            echo "::error::no repositories requested"
+            exit 1
+          fi
+
+          for item in "${requested[@]}"; do
+            slug="${aliases[$item]:-$item}"
+            if [[ "$slug" != */* ]]; then
+              echo "::error::cannot resolve '$item'; use a short name or owner/name"
+              exit 1
+            fi
+
+            dir="$RUNNER_TEMP/repos/${slug//\//__}"
+            if [ ! -d "$dir/.git" ]; then
+              echo "::group::Cloning $slug"
+              if [[ "$REF" =~ ^[0-9a-f]{40}$ ]]; then
+                git init -q "$dir"
+                git -C "$dir" remote add origin "https://github.com/$slug.git"
+                git -C "$dir" fetch -q --depth 1 origin "$REF"
+                git -C "$dir" checkout -q FETCH_HEAD
+              elif [ -n "$REF" ]; then
+                git clone -q --depth 1 --branch "$REF" "https://github.com/$slug.git" "$dir"
+              else
+                git clone -q --depth 1 "https://github.com/$slug.git" "$dir"
+              fi
+              echo "::endgroup::"
+            fi
+
+            echo "$slug=$dir" >> "$RUNNER_TEMP/repo-args.txt"
+            du -sh "$dir"
+          done
+
+          # The clone parent contains every checkout and nothing else, so it is
+          # also a valid scan root. Scanning it measures both binaries on one
+          # large tree, which is the closest match to a real monorepo workload.
+          if [ "$COMBINED" = "true" ] && [ "$(wc -l < "$RUNNER_TEMP/repo-args.txt")" -ge 2 ]; then
+            echo "all-repos=$RUNNER_TEMP/repos" >> "$RUNNER_TEMP/repo-args.txt"
+          fi
+
+      - name: Run comparison
+        env:
+          BY_FILE: ${{ inputs.by_file }}
+          NO_GITIGNORE: ${{ inputs.no_gitignore }}
+        run: |
+          set -euo pipefail
+
+          mapfile -t repo_entries < "$RUNNER_TEMP/repo-args.txt"
+          args=()
+          for entry in "${repo_entries[@]}"; do
+            args+=(--repo "$entry")
+          done
+
+          modes=()
+          if [ "$BY_FILE" = "true" ]; then
+            modes+=(--by-file)
+          fi
+          if [ "$NO_GITIGNORE" = "true" ]; then
+            modes+=(--no-gitignore)
+          fi
+
+          python3 .github/scripts/bench.py \
+            --kazu "$RUNNER_TEMP/kazu-head/kazu" \
+            --kazu-base "$RUNNER_TEMP/kazu-base/kazu" \
+            --scc "" \
+            --tokei "" \
+            --mezura "" \
+            --rounds "${{ inputs.rounds }}" \
+            --workers "${{ inputs.workers }}" \
+            "${modes[@]}" \
+            "${args[@]}" \
+            --json bench-compare.json \
+            --markdown bench-compare.md \
+            --svg bench-compare.svg
+
+      - name: Publish summary
+        if: always()
+        run: |
+          {
+            echo "## Environment"
+            echo
+            echo "- Runner: \`$(uname -srm)\`"
+            echo "- CPUs: $(nproc)"
+            echo "- Zig: \`$(zig version 2>/dev/null || echo unknown)\`"
+            echo "- Head: \`$(git rev-parse HEAD)\`"
+            echo "- Base: \`$(cat "$RUNNER_TEMP/base-sha.txt" 2>/dev/null || echo unknown)\`"
+            echo
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -f bench-compare.md ]; then
+            cat bench-compare.md >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Benchmark did not produce a report." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-compare
+          path: |
+            bench-compare.json
+            bench-compare.md
+            bench-compare.svg
+          if-no-files-found: warn

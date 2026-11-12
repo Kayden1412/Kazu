@@ -218,6 +218,22 @@ Markdown report is written to the job summary and includes a text bar chart of
 peak memory per tool; the Markdown, JSON, and a standalone peak-memory SVG chart
 (`bench-memory.svg`) are uploaded as an artifact.
 
+To compare the current commit against an earlier one, run the **Benchmark
+compare** workflow. It takes the same repository list, ref, rounds, workers,
+Zig version, combined, per-file, and ignore toggles, plus a `base_ref` (default
+`HEAD^`). The workflow checks out the repository with full history, builds the
+head, creates a detached worktree for the base commit, builds it with the same
+Zig toolchain, and times both binaries interleaved on the same checkouts. The
+report is written to the job summary and uploaded as `bench-compare.*`. Locally,
+the same comparison uses `--kazu` and `--kazu-base`:
+
+```sh
+python3 .github/scripts/bench.py \
+  --kazu ./zig-out/bin/kazu --kazu-base /path/to/base/kazu \
+  --scc "" --tokei "" --mezura "" \
+  --repo "kazu=$PWD" --rounds 7 --markdown compare.md
+```
+
 The driver runs `mezura` with `--counting region`, `--count-minified`,
 `--count-generated`, `--count-not-code`, and `--search-in-dotted` so it uses
 the same cloc/tokei/scc line model and counts the files the other tools count;
@@ -261,5 +277,6 @@ zig build test
 - `src/format.zig` - table, JSON, Markdown, HTML, and ZON renderers
 - `src/main.zig` - CLI parsing, selective `std.Io` directory walking, and batched `std.Io` workers
 - `src/root.zig` - public library module
-- `.github/workflows/bench.yml` - manual `kazu` vs `scc` vs `tokei` benchmark workflow
+- `.github/workflows/bench.yml` - manual `kazu` vs `scc` vs `tokei` vs `mezura` benchmark workflow
+- `.github/workflows/bench-compare.yml` - manual current-vs-base `kazu` benchmark workflow
 - `.github/scripts/bench.py` - interleaved benchmark driver used by the workflow
