@@ -217,7 +217,11 @@ Single-shot timings are meaningless on a shared host.
   `kazu` alone. It accepts the same repository/round/worker/toggle inputs plus
   `base_ref` (default `HEAD^`), builds the head and a detached-worktree build of
   the base with the same Zig version, and passes both binaries to `bench.py` via
-  `--kazu` and `--kazu-base`. The driver interleaves the selected tools each
+  `--kazu` and `--kazu-base`. Both builds use `-Dstrip` to keep the binaries
+  small; the base build falls back to no strip when the older commit does not
+  define the option. The built binaries are cached with `actions/cache` under
+  keys that include the commit SHA, Zig version, and strip flag, so reruns skip
+  the rebuild. The driver interleaves the selected tools each
   round (forward, then reversed) and derives the report title from the tool
   list, so a two-binary run reports `# kazu vs kazu-base`. `--kazu-base` is
   empty by default, so the cross-tool workflow is unchanged.

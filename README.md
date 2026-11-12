@@ -11,7 +11,8 @@ zig build -Doptimize=fast
 ./zig-out/bin/kazu .
 ```
 
-The native build is a static binary; no target override is needed.
+The native build is a static binary; no target override is needed. Add
+`-Dstrip` to drop debug info and produce a much smaller executable.
 
 ## Usage
 
@@ -221,11 +222,14 @@ peak memory per tool; the Markdown, JSON, and a standalone peak-memory SVG chart
 To compare the current commit against an earlier one, run the **Benchmark
 compare** workflow. It takes the same repository list, ref, rounds, workers,
 Zig version, combined, per-file, and ignore toggles, plus a `base_ref` (default
-`HEAD^`). The workflow checks out the repository with full history, builds the
-head, creates a detached worktree for the base commit, builds it with the same
-Zig toolchain, and times both binaries interleaved on the same checkouts. The
-report is written to the job summary and uploaded as `bench-compare.*`. Locally,
-the same comparison uses `--kazu` and `--kazu-base`:
+`HEAD^`). The workflow checks out the repository with full history, resolves
+the base commit, builds the head, creates a detached worktree for the base
+commit, and builds it with the same Zig toolchain. Both binaries are built with
+`-Dstrip` (when the commit supports it) and cached by commit SHA and Zig
+version, so rerunning a comparison reuses the existing binaries. The two
+binaries are timed interleaved on the same checkouts. The report is written to
+the job summary and uploaded as `bench-compare.*`. Locally, the same comparison
+uses `--kazu` and `--kazu-base`:
 
 ```sh
 python3 .github/scripts/bench.py \

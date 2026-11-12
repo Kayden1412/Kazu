@@ -85,16 +85,8 @@ jobs:
         with:
           version: ${{ inputs.zig_version }}
 
-      - name: Build head kazu
-        run: |
-          set -euo pipefail
-          zig version
-          zig build -Doptimize=fast
-          mkdir -p "$RUNNER_TEMP/kazu-head"
-          cp zig-out/bin/kazu "$RUNNER_TEMP/kazu-head/kazu"
-          "$RUNNER_TEMP/kazu-head/kazu" --version
-
-      - name: Build base kazu
+      - name: Resolve base commit
+        id: base
         env:
           BASE_REF: ${{ inputs.base_ref }}
         run: |
@@ -108,12 +100,58 @@ jobs:
           fi
           echo "$BASE_SHA" > "$RUNNER_TEMP/base-sha.txt"
           echo "base commit: $BASE_SHA ($(git log -1 --format=%s "$BASE_SHA"))"
+          echo "sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Cache head binary
+        id: cache-head
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/kazu-head
+          key: kazu-bin-head-${{ github.sha }}-zig-${{ inputs.zig_version }}-strip-v1
+
+      - name: Cache base binary
+        id: cache-base
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/kazu-base
+          key: kazu-bin-base-${{ steps.base.outputs.sha }}-zig-${{ inputs.zig_version }}-strip-v1
+
+      - name: Build head kazu
+        if: steps.cache-head.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          zig version
+          zig build -Doptimize=fast -Dstrip
+          mkdir -p "$RUNNER_TEMP/kazu-head"
+          cp zig-out/bin/kazu "$RUNNER_TEMP/kazu-head/kazu"
+
+      - name: Build base kazu
+        if: steps.cache-base.outputs.cache-hit != 'true'
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          set -euo pipefail
           git worktree add --detach "$RUNNER_TEMP/kazu-base-src" "$BASE_SHA"
           cd "$RUNNER_TEMP/kazu-base-src"
-          zig build -Doptimize=fast
+          # Older commits may not define the strip option yet.
+          strip_flag=()
+          if zig build -h 2>&1 | grep -q -- '-Dstrip'; then
+            strip_flag=(-Dstrip)
+          else
+            echo "::warning::base commit does not support -Dstrip; building without it"
+          fi
+          zig build -Doptimize=fast "${strip_flag[@]}"
           mkdir -p "$RUNNER_TEMP/kazu-base"
           cp zig-out/bin/kazu "$RUNNER_TEMP/kazu-base/kazu"
+          cd "$GITHUB_WORKSPACE"
+          git worktree remove --force "$RUNNER_TEMP/kazu-base-src"
+
+      - name: Verify binaries
+        run: |
+          set -euo pipefail
+          "$RUNNER_TEMP/kazu-head/kazu" --version
           "$RUNNER_TEMP/kazu-base/kazu" --version
+          ls -l "$RUNNER_TEMP/kazu-head/kazu" "$RUNNER_TEMP/kazu-base/kazu"
 
       - name: Clone repositories
         env:

@@ -6,6 +6,9 @@ pub fn build(b: *std.Build) void {
     // between debug, safe, fast, and small. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
     const optimize = b.standardOptimizeOption(.{});
+    // Strip debug info from the installed executable when requested with
+    // `-Dstrip`, which produces a much smaller release binary.
+    const strip = b.option(bool, "strip", "Strip debug info from the executable") orelse false;
     // It's also possible to define more custom flags to toggle optional features
     // of this build script using `b.option()`. All defined flags (including
     // target and optimize options) will be listed when running `zig build --help`
@@ -63,6 +66,7 @@ pub fn build(b: *std.Build) void {
             // definition if desireable (e.g. firmware for embedded devices).
             .target = target,
             .optimize = optimize,
+            .strip = strip,
             // List of modules available for import in source files part of the
             // root module.
             .imports = &.{
