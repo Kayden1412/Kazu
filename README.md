@@ -205,17 +205,17 @@ To compare `kazu` against `scc`, `tokei`, and `mezura` on large repositories,
 run the **Benchmark** workflow from the Actions tab. It is
 `workflow_dispatch`-only and accepts a repository list (`linux`, `zig`, `go`,
 `rust`, `ghostty`, or any `owner/name`), an optional ref, the number of rounds,
-a worker count, the Zig version, an optional mezura ref, whether to add a
+a worker count, the Zig version, optional scc and mezura refs, whether to add a
 combined run, and toggles for per-file output (`--by-file` / `--files`) and for
 disabling ignore files on every tool. The workflow shallow-clones each
-repository, builds `kazu`, clones and builds `mezura` with
-`cargo build --release --bin mezura`, and runs all four tools with their default
-ignore-file behaviour unless the ignore toggle is enabled. With **combined**
-enabled it also scans the parent directory of every checkout as one large tree,
-which approximates a monorepo workload and exercises the walker, the worker
-pool, and per-directory ignore-file handling at scale. The Markdown report is
-written to the job summary and includes a text bar chart of peak memory per
-tool; the Markdown, JSON, and a standalone peak-memory SVG chart
+repository, builds `kazu`, clones and builds `scc` and `mezura` from source
+(`go build` and `cargo build --release --bin mezura`), and runs all four tools
+with their default ignore-file behaviour unless the ignore toggle is enabled.
+With **combined** enabled it also scans the parent directory of every checkout
+as one large tree, which approximates a monorepo workload and exercises the
+walker, the worker pool, and per-directory ignore-file handling at scale. The
+Markdown report is written to the job summary and includes a text bar chart of
+peak memory per tool; the Markdown, JSON, and a standalone peak-memory SVG chart
 (`bench-memory.svg`) are uploaded as an artifact.
 
 The driver runs `mezura` with `--counting region`, `--count-minified`,

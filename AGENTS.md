@@ -203,16 +203,16 @@ Single-shot timings are meaningless on a shared host.
   tokei, and `--no-gitignore --no-ignore-files` for mezura. The `by_file` input
   switches all four tools to per-file output (`--by-file` for kazu/scc/mezura,
   `--files` for tokei; tokei's JSON always includes per-file reports). The
-  workflow builds mezura from source with
-  `cargo build --release --bin mezura`; locally, point `--mezura` at an
-  existing binary instead. The driver runs mezura with `--counting region`,
-  `--count-minified`, `--count-generated`, `--count-not-code`, and
-  `--search-in-dotted` so it uses the same line model and file set as the other
-  tools. The `combined` input adds one scan of the clone parent, so the tools
-  are also measured on a single large tree. `bench.py --svg` writes a grouped
-  peak-RSS bar chart; the workflow attaches it as `bench-memory.svg` and also
-  renders a text bar chart in the Markdown report (GitHub strips inline SVG
-  from Markdown).
+  workflow builds scc and mezura from source (`go build` for scc and
+  `cargo build --release --bin mezura` for mezura); locally, point `--scc` /
+  `--mezura` at existing binaries instead. The driver runs mezura with
+  `--counting region`, `--count-minified`, `--count-generated`,
+  `--count-not-code`, and `--search-in-dotted` so it uses the same line model
+  and file set as the other tools. The `combined` input adds one scan of the
+  clone parent, so the tools are also measured on a single large tree.
+  `bench.py --svg` writes a grouped peak-RSS bar chart; the workflow attaches
+  it as `bench-memory.svg` and also renders a text bar chart in the Markdown
+  report (GitHub strips inline SVG from Markdown).
 
 ## Gotchas
 

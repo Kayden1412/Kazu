@@ -36,6 +36,11 @@ on:
         required: false
         default: "0.17.1"
         type: string
+      scc_ref:
+        description: Branch, tag, or commit SHA to check out for scc (empty = default branch)
+        required: false
+        default: ""
+        type: string
       mezura_ref:
         description: Branch, tag, or commit SHA to check out for mezura (empty = default branch)
         required: false
@@ -73,6 +78,7 @@ concurrency:
 
 env:
   TOKEI_VERSION: "15.0.0"
+  SCC_REPO: "https://github.com/boyter/scc"
   MEZURA_REPO: "https://github.com/subamanis/mezura"
 
 jobs:
@@ -97,11 +103,37 @@ jobs:
           zig build -Doptimize=fast
           ./zig-out/bin/kazu --version
 
-      - name: Install scc
+      - name: Fetch scc
+        env:
+          SCC_REF: ${{ inputs.scc_ref }}
         run: |
           set -euo pipefail
-          go install github.com/boyter/scc/v3@latest
-          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          if [ -n "$SCC_REF" ]; then
+            if [[ "$SCC_REF" =~ ^[0-9a-f]{40}$ ]]; then
+              git init -q "$RUNNER_TEMP/scc"
+              git -C "$RUNNER_TEMP/scc" remote add origin "$SCC_REPO"
+              git -C "$RUNNER_TEMP/scc" fetch -q --depth 1 origin "$SCC_REF"
+              git -C "$RUNNER_TEMP/scc" checkout -q FETCH_HEAD
+            else
+              git clone -q --depth 1 --branch "$SCC_REF" "$SCC_REPO" "$RUNNER_TEMP/scc"
+            fi
+          else
+            git clone -q --depth 1 "$SCC_REPO" "$RUNNER_TEMP/scc"
+          fi
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ runner.temp }}/scc/go.mod
+          cache-dependency-path: ${{ runner.temp }}/scc/go.sum
+
+      - name: Build scc
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/scc"
+          go build -o "$RUNNER_TEMP/scc/scc" .
+          "$RUNNER_TEMP/scc/scc" --version
+          echo "$RUNNER_TEMP/scc" >> "$GITHUB_PATH"
 
       - name: Restore cached tokei
         id: tokei-cache
