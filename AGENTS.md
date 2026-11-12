@@ -9,7 +9,7 @@ Guidance for agents working in this repository.
 file's language, classifies every line as code, comment, or blank, and reports
 per-language totals.
 
-- Zig **0.17.0**, no libc dependency in the default static build.
+- Zig **0.17.1**, no libc dependency in the default static build.
 - No runtime dependencies: concurrency and file I/O both come from `std.Io`.
 - The public library surface is `src/root.zig`; the CLI is `src/main.zig`.
 
@@ -153,7 +153,7 @@ These match `scc`/`cloc`. Any change needs a corresponding test.
 4. Use the shared comment/block constants where they match.
 5. Add detection coverage to `test "detect languages added from scc"` and, if
    the markers are unusual, a counting test in `src/count.zig`.
-6. Run `zig test src/root.zig`, then the musl build and test step.
+6. Run `zig test src/root.zig`, then `zig build test`.
 
 ## Validating against `scc`
 
@@ -179,8 +179,8 @@ divergences:
 
 Single-shot timings are meaningless on a shared host.
 
-- Prefer an **interleaved** driver: alternate the two commands each round and
-  report medians, so drift affects both equally.
+- Prefer an **interleaved** driver: alternate the commands each round and
+  report medians, so drift affects every tool equally.
 - See `ENVIRONMENT.local.md` (local, gitignored) for this machine's CPU
   topology, throttling behaviour, and sandbox quirks.
 - `hyperfine -S --warmup 5 --runs 50` is a useful cross-check. `-S` is required
@@ -216,8 +216,6 @@ Single-shot timings are meaningless on a shared host.
 
 ## Gotchas
 
-- This workspace is **not** a git repository. Do not assume `git status` or
-  commits are available.
 - Symlinks are not followed by default, and non-regular files (FIFOs, sockets,
   devices) are always skipped. `.unknown` directory entries are stat'ed without
   following symlinks so they resolve to a real file, directory, or skip.

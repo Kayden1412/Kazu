@@ -34,7 +34,7 @@ on:
       zig_version:
         description: Zig version used to build kazu
         required: false
-        default: "0.17.0"
+        default: "0.17.1"
         type: string
       mezura_ref:
         description: Branch, tag, or commit SHA to check out for mezura (empty = default branch)
