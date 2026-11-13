@@ -2,10 +2,11 @@
 //!
 //! Directory walking is sequential and uses `std.Io.Dir.walkSelectively`, so
 //! excluded and ignored directories can be pruned before they are opened.
-//! File paths are collected in batches, and each batch is split across a group
-//! of `std.Io` workers with one atomic counter. Every file and directory
-//! operation goes through `std.Io`; its threaded backend runs the syscall
-//! inline in the calling thread.
+//! File paths are collected in two alternating batch slots, so the walker can
+//! fill the next batch while the previous one is counted. Each batch is split
+//! across a group of `std.Io` workers with one atomic counter. Every file and
+//! directory operation goes through `std.Io`; its threaded backend runs the
+//! syscall inline in the calling thread.
 
 const std = @import("std");
 const kazu = @import("kazu");
@@ -335,7 +336,8 @@ const batch_size: usize = 4096;
 
 /// Walks the tree and hands batches of files to a short-lived worker group.
 /// Keeping the queue out of the hot path avoids per-file channel wakeups: each
-/// batch is split dynamically with one atomic counter.
+/// batch is split dynamically with one atomic counter.  Two batch slots let the
+/// walker fill the next batch while the previous one is counted.
 const Batcher = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
@@ -344,52 +346,80 @@ const Batcher = struct {
     /// When set, each counted file is retained for `--by-file` output and the
     /// batch hands ownership of the path to this list instead of freeing it.
     files: ?*std.ArrayList(format.FileSummary) = null,
-    tasks: std.ArrayList(FileTask) = .empty,
-    results: std.ArrayList(?FileResult) = .empty,
+    slots: [2]BatchSlot = .{ .{}, .{} },
+    current: usize = 0,
+    group: std.Io.Group = .init,
+
+    const BatchSlot = struct {
+        tasks: std.ArrayList(FileTask) = .empty,
+        results: std.ArrayList(?FileResult) = .empty,
+        /// Lives with the slot because workers can outlive `start`.
+        next: std.atomic.Value(usize) = std.atomic.Value(usize).init(0),
+        pending: bool = false,
+    };
 
     /// Takes ownership of `task.path` even when an error is returned.
     fn push(self: *Batcher, task: FileTask) !void {
-        self.tasks.append(self.gpa, task) catch |err| {
+        const slot = &self.slots[self.current];
+        slot.tasks.append(self.gpa, task) catch |err| {
             self.gpa.free(task.path);
             return err;
         };
-        if (self.tasks.items.len == batch_size) try self.flush();
+        if (slot.tasks.items.len >= batch_size) try self.dispatch();
     }
 
-    fn flush(self: *Batcher) !void {
-        if (self.tasks.items.len == 0) return;
+    /// Start counting the current slot, then switch to the other slot so the
+    /// walker can fill it while this batch runs.  The previous batch must be
+    /// finished before its slot can be reused.
+    fn dispatch(self: *Batcher) !void {
+        const index = self.current;
+        if (self.slots[index].tasks.items.len == 0) return;
 
-        try self.results.resize(self.gpa, self.tasks.items.len);
-        @memset(self.results.items, null);
+        const other = 1 - index;
+        if (self.slots[other].pending) {
+            try self.group.await(self.io);
+            self.fold(other);
+            self.slots[other].pending = false;
+        }
+
+        try self.start(index);
+        self.slots[index].pending = true;
+        self.current = other;
+    }
+
+    fn start(self: *Batcher, index: usize) !void {
+        const slot = &self.slots[index];
+        try slot.results.resize(self.gpa, slot.tasks.items.len);
+        @memset(slot.results.items, null);
 
         // Reserve room up front so a successful count can always move its path
         // into the per-file list without a second allocation.
-        if (self.files) |files| try files.ensureUnusedCapacity(self.gpa, self.tasks.items.len);
+        if (self.files) |files| try files.ensureUnusedCapacity(self.gpa, slot.tasks.items.len);
 
-        var next = std.atomic.Value(usize).init(0);
-        var group: std.Io.Group = .init;
+        slot.next = std.atomic.Value(usize).init(0);
         var spawned: usize = 0;
-        const wanted = @min(self.workers, self.tasks.items.len);
+        const wanted = @min(self.workers, slot.tasks.items.len);
         while (spawned < wanted) : (spawned += 1) {
             // A failed spawn is fine as long as at least one worker runs: the
             // shared counter keeps every worker busy until the batch is empty.
-            group.concurrent(self.io, batchWorker, .{
+            self.group.concurrent(self.io, batchWorker, .{
                 self.io,
                 self.gpa,
-                self.tasks.items,
-                self.results.items,
-                &next,
+                slot.tasks.items,
+                slot.results.items,
+                &slot.next,
             }) catch break;
         }
         if (spawned == 0) {
             // No concurrency available (for example a single-threaded `Io`
             // implementation); count the batch on this thread.
-            batchWorker(self.io, self.gpa, self.tasks.items, self.results.items, &next) catch {};
-        } else {
-            try group.await(self.io);
+            batchWorker(self.io, self.gpa, slot.tasks.items, slot.results.items, &slot.next) catch {};
         }
+    }
 
-        for (self.tasks.items, self.results.items) |task, maybe_result| {
+    fn fold(self: *Batcher, index: usize) void {
+        const slot = &self.slots[index];
+        for (slot.tasks.items, slot.results.items) |task, maybe_result| {
             const result = maybe_result orelse {
                 self.gpa.free(task.path);
                 continue;
@@ -416,14 +446,50 @@ const Batcher = struct {
             stat.code += result.counts.code;
         }
 
-        self.tasks.clearRetainingCapacity();
-        self.results.clearRetainingCapacity();
+        slot.tasks.clearRetainingCapacity();
+        slot.results.clearRetainingCapacity();
+    }
+
+    fn flush(self: *Batcher) !void {
+        // Finish a batch dispatched by `push` before starting the tail batch.
+        // Keeping at most one un-folded batch alive also keeps the per-file
+        // list's reserved capacity valid.
+        const index = self.current;
+        const other = 1 - index;
+        if (self.slots[other].pending) {
+            try self.group.await(self.io);
+            self.fold(other);
+            self.slots[other].pending = false;
+        }
+
+        if (self.slots[index].tasks.items.len > 0) {
+            try self.start(index);
+            self.slots[index].pending = true;
+            try self.group.await(self.io);
+            self.fold(index);
+            self.slots[index].pending = false;
+        }
+    }
+
+    /// Wait for every dispatched batch and fold its results.  Used by `deinit`
+    /// when an error skipped `flush`.
+    fn finishPending(self: *Batcher) void {
+        self.group.await(self.io) catch {};
+        for (0..self.slots.len) |i| {
+            if (self.slots[i].pending) {
+                self.fold(i);
+                self.slots[i].pending = false;
+            }
+        }
     }
 
     fn deinit(self: *Batcher) void {
-        for (self.tasks.items) |task| self.gpa.free(task.path);
-        self.tasks.deinit(self.gpa);
-        self.results.deinit(self.gpa);
+        self.finishPending();
+        for (&self.slots) |*slot| {
+            for (slot.tasks.items) |task| self.gpa.free(task.path);
+            slot.tasks.deinit(self.gpa);
+            slot.results.deinit(self.gpa);
+        }
     }
 };
 
@@ -523,14 +589,9 @@ fn processFile(
         lang_index = languages.detectShebang(head[0..head_len]) orelse return null;
     }
 
-    const size = (try file.stat(io)).size;
-    if (size > max_file_size) {
-        std.log.warn("kazu: skipping {s}: file is larger than 256 MiB", .{task.path});
-        return null;
-    }
-
     var counter = count.Counter.init(&languages.languages[lang_index.?]);
     var offset: u64 = 0;
+    var size_checked = false;
     while (true) {
         const read_len = try file.readPositional(io, &.{buffer}, offset);
         if (read_len == 0) break;
@@ -538,7 +599,20 @@ fn processFile(
             std.log.debug("kazu: skipping {s}: binary file", .{task.path});
             return null;
         }
+        // Only a file that fills the first read can exceed the size limit, so
+        // the common small-file case never pays for a stat.
+        if (!size_checked and read_len == buffer.len) {
+            size_checked = true;
+            if ((try file.stat(io)).size > max_file_size) {
+                std.log.warn("kazu: skipping {s}: file is larger than 256 MiB", .{task.path});
+                return null;
+            }
+        }
         offset += read_len;
+        if (offset > max_file_size) {
+            std.log.warn("kazu: skipping {s}: file is larger than 256 MiB", .{task.path});
+            return null;
+        }
         counter.feed(buffer[0..read_len]);
     }
 

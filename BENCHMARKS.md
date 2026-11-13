@@ -359,6 +359,42 @@ it is listed only to separate hash cost from case-normalisation cost.
 - rapidhash V3 is by Nicolas De Carli (MIT); the Zig port adapted here is
   [`baskingspot/stdx`](https://github.com/baskingspot/stdx).
 
+## Double-buffered batches and no per-file stat
+
+Two changes to the I/O path:
+
+- `Batcher` now has two batch slots. `push` dispatches a full 4096-file batch
+  and immediately starts filling the other slot, so the walker and the workers
+  overlap. `flush` finishes the in-flight slot and then the tail batch.
+- `processFile` no longer stats every file. The 256 MiB limit is enforced while
+  reading, and the stat only happens when the first 64 KiB read fills the
+  buffer (a smaller file cannot exceed the limit). This removes one `statx`
+  per file from the common path.
+
+Interleaved medians, `taskset -c 0-3 --workers 4`, base `e67c626` vs the
+change. Host caveat: this workspace runs under PRoot on f2fs, so syscalls are
+serialized and their cost is amplified; the syscall-related gains will be
+smaller on real hardware.
+
+| Workload | Base | New | Ratio |
+| --- | ---: | ---: | ---: |
+| LangArena (default ignores) | 454.9 ms | 405.7 ms | **0.89x** |
+| LangArena (`--no-gitignore --no-ignore`) | 405.4 ms | 359.3 ms | **0.89x** |
+| detbench (20k tiny files) | 5402.9 ms | 3996.5 ms | **0.74x** |
+| dirheavy4 (4k dirs, 16k files) | 6095.3 ms | 5143.4 ms | **0.84x** |
+| walkheavy (4k dirs, 100 files) | 3563.5 ms | 3585.0 ms | 1.01x |
+
+Syscall counts on LangArena (`--no-*`): 4,639 -> 3,874 (-16.5%), with
+`newfstatat` 766 -> 1. On detbench: 100,978 -> 80,977 (-19.8%), with
+`newfstatat` 20,001 -> 1.
+
+The double buffer alone was worth 0.81x on dirheavy4 (walk ~48% of wall) and
+was neutral on LangArena (one batch) and detbench (walk ~5% of wall). The stat
+removal alone was worth 0.87x on LangArena and 0.75x on detbench.
+
+Output was byte-identical to the base build on `src`, LangArena, detbench,
+dirheavy4, walkheavy, and `--by-file`; `bs build test` passes.
+
 ## Conclusions
 
 - kazu beats scc on every measured workload: LangArena x4 0.78x, LangArena
@@ -374,15 +410,19 @@ it is listed only to separate hash cost from case-normalisation cost.
 - The selective `std.Io` walk cut walk time by 0.57–0.92x and full tree time by
   0.82–0.96x. `enter`-based pruning keeps ignored trees from being opened.
 - A 1 MiB read buffer is no longer useful; 64 KiB is faster with inline reads.
+- Double-buffering the batcher and dropping the per-file stat were worth
+  0.74–0.89x on file-bearing trees; walkheavy is unchanged because it is
+  walk-bound.
 
 Suggested follow-ups, in order:
 
 1. Re-run this file's workloads after any scanner, I/O, walk, or worker-pool
    change.
-2. Profile the per-file scanner and language detection path; I/O and walking
-   are no longer the limiter.
-3. Only revisit batching if a workload is dominated by directories rather than
-   files (the 4000-dir/100-file tree is the known ~1.6% regression).
+2. On this PRoot host, per-file syscall count is still the limiter; on real
+   hardware, profile the scanner and language detection next.
+3. Directory-heavy trees are still walk-bound: walkheavy spends ~98% of its
+   time in the single-threaded walk. Batching cannot help there; a
+   parallel/work-stealing walker is the remaining structural change.
 
 ## Fixtures
 

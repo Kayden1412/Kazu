@@ -4,5 +4,6 @@ zig-pkg/
 *.o
 STRACE.txt
 ENVIRONMENT.local.md
+TODO.md
 __pycache__/
 SKILL.md

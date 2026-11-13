@@ -2,7 +2,7 @@
 
 A fast, parallel source code counter in the spirit of [`scc`](https://github.com/boyter/scc) and `cloc`.
 
-`kazu` walks a source tree, detects each file's language, classifies every line as **code**, **comment**, or **blank**, and reports the totals per language. The walk uses `std.Io.Dir.walkSelectively`, so excluded and ignored directories are pruned before they are opened. Files are counted in parallel batches: each batch is split across a group of `std.Io` workers, and every read goes through `std.Io` as well, so the binary has no runtime dependencies beyond Zig's standard library.
+`kazu` walks a source tree, detects each file's language, classifies every line as **code**, **comment**, or **blank**, and reports the totals per language. The walk uses `std.Io.Dir.walkSelectively`, so excluded and ignored directories are pruned before they are opened. Files are counted in parallel batches: two alternating batch slots let the walker fill the next batch while the previous one is counted, each batch is split across a group of `std.Io` workers, and every read goes through `std.Io` as well, so the binary has no runtime dependencies beyond Zig's standard library.
 
 ## Build
 

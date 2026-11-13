@@ -61,17 +61,22 @@ validate library changes. Host-specific notes live in `ENVIRONMENT.local.md`
    ownership of the path string; the batch frees it. It returns whether the
    file was queued, which lets `queueWalked` record the canonical path in the
    `--include-symlinks` dedup set only for counted files.
-4. `Batcher.flush` splits one batch (4096 files) across a short-lived
-   `std.Io.Group` with one `std.atomic.Value(usize)` counter. Workers read the
-   file in 64 KiB chunks through `std.Io` (or sniff a `#!` line when the
-   language is unknown), reject a file whose first 10,000 bytes contain a NUL,
-   and feed the rest to `count.Counter`. Each worker owns one reusable read
-   buffer; nothing is allocated per file. Results are written into a pre-sized
-   slot array, so no channel or collector is involved.
-5. After `Group.await`, the batcher frees the paths and folds each
-   `FileResult` into the `format.Summary` for its language. With `--by-file`
-   it instead hands each counted path to a `FileSummary` list; that list owns
-   the strings and frees them after the report is written.
+4. `Batcher.push` dispatches a full batch (4096 files) and switches to the
+   other of two batch slots, so the walker can fill the next batch while the
+   current one is counted. `Batcher.dispatch`/`start` split a batch across a
+   short-lived `std.Io.Group` with one `std.atomic.Value(usize)` per slot.
+   Workers read the file in 64 KiB chunks through `std.Io` (or sniff a `#!`
+   line when the language is unknown), reject a file whose first 10,000 bytes
+   contain a NUL, enforce the 256 MiB limit while reading (statting only when
+   the first read fills the buffer), and feed the rest to `count.Counter`. Each
+   worker owns one reusable read buffer; nothing is allocated per file. Results
+   are written into a pre-sized slot array, so no channel or collector is
+   involved.
+5. `Batcher.flush` finishes the batch left over from the walk: it awaits the
+   in-flight slot, then counts and folds the tail batch. Folding frees the
+   paths and adds each `FileResult` to the `format.Summary` for its language.
+   With `--by-file` it instead hands each counted path to a `FileSummary` list;
+   that list owns the strings and frees them after the report is written.
 6. `format.writeReport` renders the selected format. Per-file mode passes the
    file list alongside the language rows: table/Markdown/HTML nest file rows
    under their language, while JSON/ZON emit a flat per-file array.
@@ -92,7 +97,8 @@ orchestration-only so the pure modules remain testable.
 - Allocator discipline matters. `run` uses the GPA from `std.process.Init`;
   path strings are owned by whoever receives them. `queueFile` frees paths it
   rejects, `Batcher.push` frees the path even when appending fails, and
-  `flush`/`deinit` free every accepted path. `queueWalked` frees the path when
+  `Batcher.fold`/`deinit` free or hand off every accepted path. `deinit` also
+  awaits any in-flight batch before freeing. `queueWalked` frees the path when
   the dedup set already holds it.
 - Avoid allocations in the hot path (`countLines` and `Counter.feed` work on
   borrowed slices; `Counter` carries at most `max_marker_len` bytes between
