@@ -208,8 +208,12 @@ run the **Benchmark** workflow from the Actions tab. It is
 `rust`, `ghostty`, or any `owner/name`), an optional ref, the number of rounds,
 a worker count, the Zig version, optional scc and mezura refs, whether to add a
 combined run, and toggles for per-file output (`--by-file` / `--files`) and for
-disabling ignore files on every tool. The workflow shallow-clones each
-repository, builds `kazu`, clones and builds `scc` and `mezura` from source
+disabling ignore files on every tool. `kazu_refs` builds extra kazu commits with
+the same Zig version and times them in the same run, so several variants can be
+compared against each other and the other tools at once; the checked-out commit
+is always included as `kazu`, and each ref appears as `kazu-<short sha>`. The
+report lists every tool's commit SHA and subject. The workflow shallow-clones
+each repository, builds `kazu`, clones and builds `scc` and `mezura` from source
 (`go build` and `cargo build --release --bin mezura`), and runs all four tools
 with their default ignore-file behaviour unless the ignore toggle is enabled.
 With **combined** enabled it also scans the parent directory of every checkout
@@ -228,8 +232,8 @@ commit, and builds it with the same Zig toolchain. Both binaries are built with
 `-Dstrip` (when the commit supports it) and cached by commit SHA and Zig
 version, so rerunning a comparison reuses the existing binaries. The two
 binaries are timed interleaved on the same checkouts. The report is written to
-the job summary and uploaded as `bench-compare.*`. Locally, the same comparison
-uses `--kazu` and `--kazu-base`:
+the job summary and uploaded as `bench-compare.*`; it lists both commits' short
+SHA and subject. Locally, the same comparison uses `--kazu` and `--kazu-base`:
 
 ```sh
 python3 .github/scripts/bench.py \
@@ -253,6 +257,15 @@ python3 .github/scripts/bench.py \
   --mezura /root/mezura/target/release/mezura \
   --repo "kazu=$PWD" --rounds 7 --markdown results.md
 
+# time extra kazu builds in the same interleaved run
+python3 .github/scripts/bench.py \
+  --kazu ./zig-out/bin/kazu \
+  --kazu-variant kazu-abc1234=/srv/kazu/abc1234/kazu \
+  --kazu-variant kazu-def5678=/srv/kazu/def5678/kazu \
+  --describe "kazu=abc1234 first commit" \
+  --describe "kazu-abc1234=second commit" \
+  --repo "kazu=$PWD" --rounds 7 --markdown variants.md
+
 # per-repository rows plus one row that scans all checkouts at once
 python3 .github/scripts/bench.py \
   --kazu ./zig-out/bin/kazu --scc scc --tokei tokei \
@@ -262,6 +275,11 @@ python3 .github/scripts/bench.py \
   --repo "all-repos=/srv/repos" \
   --rounds 7 --markdown results.md
 ```
+
+`--kazu-variant NAME=PATH` is repeatable; each name must start with `kazu` and
+is timed alongside `--kazu`, with ratios in the report measured against the
+first kazu build. `--describe NAME=TEXT` attaches a short note (typically the
+commit SHA and subject) to that tool's version line.
 
 Pass `--by-file` and/or `--no-gitignore` to the driver to mirror the workflow
 toggles locally; both apply the matching flags to every tool. Add

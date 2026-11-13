@@ -99,7 +99,8 @@ jobs:
             BASE_SHA="$(git rev-parse --verify "FETCH_HEAD^{commit}")"
           fi
           echo "$BASE_SHA" > "$RUNNER_TEMP/base-sha.txt"
-          echo "base commit: $BASE_SHA ($(git log -1 --format=%s "$BASE_SHA"))"
+          git log -1 --format=%s "$BASE_SHA" > "$RUNNER_TEMP/base-subject.txt"
+          echo "base commit: $BASE_SHA ($(cat "$RUNNER_TEMP/base-subject.txt"))"
           echo "sha=$BASE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Cache head binary
@@ -236,9 +237,18 @@ jobs:
             modes+=(--no-gitignore)
           fi
 
+          head_sha="$(git rev-parse HEAD)"
+          head_short="${head_sha:0:7}"
+          head_subject="$(git log -1 --format=%s "$head_sha")"
+          base_sha="$(cat "$RUNNER_TEMP/base-sha.txt")"
+          base_short="${base_sha:0:7}"
+          base_subject="$(cat "$RUNNER_TEMP/base-subject.txt")"
+
           python3 .github/scripts/bench.py \
             --kazu "$RUNNER_TEMP/kazu-head/kazu" \
             --kazu-base "$RUNNER_TEMP/kazu-base/kazu" \
+            --describe "kazu=$head_short $head_subject" \
+            --describe "kazu-base=$base_short $base_subject" \
             --scc "" \
             --tokei "" \
             --mezura "" \
@@ -259,8 +269,14 @@ jobs:
             echo "- Runner: \`$(uname -srm)\`"
             echo "- CPUs: $(nproc)"
             echo "- Zig: \`$(zig version 2>/dev/null || echo unknown)\`"
-            echo "- Head: \`$(git rev-parse HEAD)\`"
-            echo "- Base: \`$(cat "$RUNNER_TEMP/base-sha.txt" 2>/dev/null || echo unknown)\`"
+            head_sha="$(git rev-parse HEAD)"
+            echo "- Head: \`${head_sha:0:7}\` $(git log -1 --format=%s "$head_sha")"
+            if [ -f "$RUNNER_TEMP/base-sha.txt" ]; then
+              base_sha="$(cat "$RUNNER_TEMP/base-sha.txt")"
+              echo "- Base: \`${base_sha:0:7}\` $(cat "$RUNNER_TEMP/base-subject.txt" 2>/dev/null)"
+            else
+              echo "- Base: unknown"
+            fi
             echo
           } >> "$GITHUB_STEP_SUMMARY"
 

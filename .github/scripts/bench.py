@@ -355,6 +355,19 @@ def tool_summary(result: ToolResult) -> dict[str, Any]:
     }
 
 
+def is_kazu(name: str) -> bool:
+    """Whether ``name`` is a kazu build rather than another tool."""
+    return name.startswith("kazu")
+
+
+def kazu_baseline(tools: list[str]) -> str | None:
+    """The first kazu build, used as the denominator for every ratio."""
+    for name in tools:
+        if is_kazu(name):
+            return name
+    return None
+
+
 def render_markdown(
     repos: list[dict[str, Any]],
     tools: list[str],
@@ -364,11 +377,11 @@ def render_markdown(
     options: Options,
     generated_at: str,
     svg_name: str | None = None,
+    descriptions: dict[str, str] | None = None,
 ) -> str:
     worker_label = "default (CPU count)" if workers <= 0 else str(workers)
+    kazu_flags = "`--no-gitignore --no-ignore`"
     ignore_flags = {
-        "kazu": "`--no-gitignore --no-ignore`",
-        "kazu-base": "`--no-gitignore --no-ignore`",
         "scc": "`--no-gitignore --no-ignore --no-scc-ignore`",
         "tokei": "`--no-ignore`",
         "mezura": "`--no-gitignore --no-ignore-files`",
@@ -376,7 +389,9 @@ def render_markdown(
     ignore_label = (
         "disabled by every tool ("
         + ", ".join(
-            f"{name} {ignore_flags[name]}" for name in tools if name in ignore_flags
+            f"{name} {kazu_flags if is_kazu(name) else ignore_flags[name]}"
+            for name in tools
+            if is_kazu(name) or name in ignore_flags
         )
         + ")"
         if options.no_gitignore
@@ -384,7 +399,7 @@ def render_markdown(
     )
     by_file_parts = []
     by_file_tools = [
-        name for name in tools if name in ("kazu", "kazu-base", "scc", "mezura")
+        name for name in tools if is_kazu(name) or name in ("scc", "mezura")
     ]
     if by_file_tools:
         by_file_parts.append("/".join(by_file_tools) + " `--by-file`")
@@ -395,6 +410,8 @@ def render_markdown(
         if options.by_file and by_file_parts
         else "off (per-language totals)"
     )
+    baseline = kazu_baseline(tools)
+    ratio_tools = [name for name in tools if name != baseline] if baseline else []
     title = " vs ".join(tools) if tools else "benchmark"
     lines: list[str] = [
         f"# {title}",
@@ -408,19 +425,18 @@ def render_markdown(
     if svg_name:
         lines.append(f"- **Memory chart:** `{svg_name}`")
     for name in tools:
-        lines.append(f"- **{name}:** `{versions.get(name, 'unknown')}`")
+        detail = (descriptions or {}).get(name)
+        suffix = f" — {detail}" if detail else ""
+        lines.append(f"- **{name}:** `{versions.get(name, 'unknown')}`{suffix}")
 
     usable = [repo for repo in repos if not repo.get("error")]
     if usable:
-        lines += [
-            "",
-            "## Summary",
-            "",
-            "| Repository | " + " | ".join(tools) + " | "
-            + " | ".join(f"kazu/{name}" for name in tools if name != "kazu") + " |",
-            "| --- | " + " | ".join("---:" for _ in tools) + " | "
-            + " | ".join("---:" for name in tools if name != "kazu") + " |",
-        ]
+        header = "| Repository | " + " | ".join(tools) + " |"
+        divider = "| --- | " + " | ".join("---:" for _ in tools) + " |"
+        if ratio_tools:
+            header += " " + " | ".join(f"{baseline}/{name}" for name in ratio_tools) + " |"
+            divider += " " + " | ".join("---:" for _ in ratio_tools) + " |"
+        lines += ["", "## Summary", "", header, divider]
         for repo in usable:
             cells = [repo["repo"]]
             medians: dict[str, float] = {}
@@ -432,11 +448,9 @@ def render_markdown(
                     cells.append(fmt_duration(median))
                 else:
                     cells.append("—")
-            for name in tools:
-                if name == "kazu":
-                    continue
-                if name in medians and "kazu" in medians and medians[name] > 0:
-                    cells.append(fmt_ratio(medians["kazu"] / medians[name]))
+            for name in ratio_tools:
+                if name in medians and baseline in medians and medians[name] > 0:
+                    cells.append(fmt_ratio(medians[baseline] / medians[name]))
                 else:
                     cells.append("—")
             lines.append("| " + " | ".join(cells) + " |")
@@ -468,13 +482,23 @@ def render_markdown(
             lines.append(f"> **Failed:** {repo['error']}")
             continue
 
+        ratio_header = f"{baseline}/tool" if baseline else "ratio"
+        ratio_note = (
+            f"`{ratio_header}` below 1.00x means the baseline kazu build was faster"
+            if baseline
+            else "no kazu baseline to compare against"
+        )
         lines += [
-            f"Timing (median of {rounds} rounds; `kazu/tool` below 1.00x means kazu was faster):",
+            f"Timing (median of {rounds} rounds; {ratio_note}):",
             "",
-            "| Tool | Median | Mean | σ | Min | Max | CPU (median) | Peak RSS | kazu/tool |",
+            f"| Tool | Median | Mean | σ | Min | Max | CPU (median) | Peak RSS | {ratio_header} |",
             "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
-        kazu_median = repo["tools"].get("kazu", {}).get("wall_ms", {}).get("median")
+        baseline_median = (
+            repo["tools"].get(baseline, {}).get("wall_ms", {}).get("median")
+            if baseline
+            else None
+        )
         for name in tools:
             entry = repo["tools"].get(name, {})
             if "wall_ms" not in entry:
@@ -483,11 +507,14 @@ def render_markdown(
             wall = entry["wall_ms"]
             cpu = entry["cpu_ms"]
             rss = entry["maxrss_kb"]
-            ratio = (
-                fmt_ratio(kazu_median / wall["median"])
-                if name != "kazu" and kazu_median and wall["median"] > 0
-                else "1.00x"
-            )
+            if baseline is None:
+                ratio = "—"
+            elif name == baseline:
+                ratio = "1.00x"
+            elif baseline_median and wall["median"] > 0:
+                ratio = fmt_ratio(baseline_median / wall["median"])
+            else:
+                ratio = "—"
             lines.append(
                 "| {name} | {median} | {mean} | {sd} | {low} | {high} | {cpu} | {rss} | {ratio} |".format(
                     name=name,
@@ -560,6 +587,22 @@ _TOOL_COLORS = {
     "mezura": "#a371f7",
 }
 
+# Extra kazu builds (one per requested ref) cycle through these so every bar in
+# the memory chart stays distinguishable.
+_VARIANT_COLORS = ["#8250df", "#db61a2", "#1f6feb", "#9a6700", "#0a7ea4", "#bf8700"]
+
+
+def tool_colors(tools: list[str]) -> dict[str, str]:
+    colors: dict[str, str] = {}
+    variant_index = 0
+    for name in tools:
+        if name in _TOOL_COLORS:
+            colors[name] = _TOOL_COLORS[name]
+        else:
+            colors[name] = _VARIANT_COLORS[variant_index % len(_VARIANT_COLORS)]
+            variant_index += 1
+    return colors
+
 
 def _svg_text(text: str) -> str:
     return (
@@ -606,6 +649,7 @@ def render_memory_svg(repos: list[dict[str, Any]], tools: list[str]) -> str:
 
     maximum = max((value for _, values in groups for _, value in values), default=0.0)
     scale_max = maximum if maximum > 0 else 1.0
+    colors = tool_colors(tools)
 
     parts: list[str] = [
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" '
@@ -621,7 +665,7 @@ def render_memory_svg(repos: list[dict[str, Any]], tools: list[str]) -> str:
     for name, entry_width in legend_entries:
         parts.append(
             f'<rect x="{legend_x}" y="16" width="12" height="12" rx="2" '
-            f'fill="{_TOOL_COLORS.get(name, "#8b949e")}"/>'
+            f'fill="{colors[name]}"/>'
         )
         parts.append(
             f'<text x="{legend_x + 18}" y="26" font-size="12" fill="#1f2328">'
@@ -652,7 +696,7 @@ def render_memory_svg(repos: list[dict[str, Any]], tools: list[str]) -> str:
                 bar_width = max(2.0, plot_width * value / scale_max)
                 parts.append(
                     f'<rect x="{left}" y="{y}" width="{bar_width:.1f}" height="{bar_height}" '
-                    f'rx="3" fill="{_TOOL_COLORS.get(name, "#8b949e")}">'
+                    f'rx="3" fill="{colors[name]}">'
                     f"<title>{_svg_text(name)}: {fmt_rss(value)}</title></rect>"
                 )
                 parts.append(
@@ -683,6 +727,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--kazu-base",
         default="",
         help="path to a baseline kazu binary to compare against --kazu",
+    )
+    parser.add_argument(
+        "--kazu-variant",
+        action="append",
+        default=[],
+        metavar="NAME=PATH",
+        help=(
+            "extra kazu build to time alongside --kazu; NAME must start with "
+            "'kazu' and be unique; repeatable"
+        ),
     )
     parser.add_argument("--scc", default="scc", help="path to the scc binary")
     parser.add_argument("--tokei", default="tokei", help="path to the tokei binary")
@@ -716,6 +770,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--timeout", type=float, default=1800.0, help="per-run timeout in seconds")
+    parser.add_argument(
+        "--describe",
+        action="append",
+        default=[],
+        metavar="NAME=TEXT",
+        help=(
+            "short description shown next to a tool's version, such as its "
+            "commit SHA and subject; repeatable"
+        ),
+    )
     parser.add_argument("--json", dest="json_path", help="write machine-readable results here")
     parser.add_argument("--markdown", dest="markdown_path", help="write a Markdown report here")
     parser.add_argument(
@@ -746,6 +810,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             parser.error(f"--repo expects NAME=PATH, got {entry!r}")
         repos.append((name, os.path.abspath(path)))
     args.repos = repos
+
+    variants: list[tuple[str, str]] = []
+    seen = {"kazu", "kazu-base", "scc", "tokei", "mezura"}
+    for entry in args.kazu_variant:
+        name, sep, path = entry.partition("=")
+        if not sep or not name or not path:
+            parser.error(f"--kazu-variant expects NAME=PATH, got {entry!r}")
+        if not name.startswith("kazu"):
+            parser.error(f"--kazu-variant name must start with 'kazu', got {name!r}")
+        if name in seen:
+            parser.error(f"--kazu-variant name {name!r} is reserved or repeated")
+        seen.add(name)
+        variants.append((name, path))
+    args.kazu_variants = variants
+
+    descriptions: dict[str, str] = {}
+    for entry in args.describe:
+        name, sep, text = entry.partition("=")
+        if not sep or not name:
+            parser.error(f"--describe expects NAME=TEXT, got {entry!r}")
+        descriptions[name] = text
+    args.descriptions = descriptions
     return args
 
 
@@ -753,24 +839,34 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     options = Options(by_file=args.by_file, no_gitignore=args.no_gitignore)
 
-    tool_paths = {
-        "kazu": args.kazu,
-        "kazu-base": args.kazu_base,
-        "scc": args.scc,
-        "tokei": args.tokei,
-        "mezura": args.mezura,
-    }
-    tools = [
-        name
-        for name in ("kazu", "kazu-base", "scc", "tokei", "mezura")
-        if tool_paths[name]
-    ]
+    kazu_entries: list[tuple[str, str]] = [("kazu", args.kazu)]
+    if args.kazu_base:
+        kazu_entries.append(("kazu-base", args.kazu_base))
+    kazu_entries.extend(args.kazu_variants)
+
+    tool_paths: dict[str, str] = {}
+    kazu_tools: set[str] = set()
+    for name, path in kazu_entries:
+        if path:
+            tool_paths[name] = path
+            kazu_tools.add(name)
+    for name, path in (
+        ("scc", args.scc),
+        ("tokei", args.tokei),
+        ("mezura", args.mezura),
+    ):
+        if path:
+            tool_paths[name] = path
+    tools = list(tool_paths)
+
     versions = {name: tool_version(tool_paths[name]) for name in tools}
     generated_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
     print("benchmark tools:", file=sys.stderr)
     for name in tools:
-        print(f"  {name}: {versions[name]} ({tool_paths[name]})", file=sys.stderr)
+        detail = args.descriptions.get(name)
+        suffix = f" [{detail}]" if detail else ""
+        print(f"  {name}: {versions[name]} ({tool_paths[name]}){suffix}", file=sys.stderr)
     print(f"rounds: {args.rounds}, kazu workers: {args.workers or 'default'}", file=sys.stderr)
     print(
         f"by-file: {options.by_file}, no-gitignore: {options.no_gitignore}",
@@ -788,21 +884,23 @@ def main(argv: list[str]) -> int:
             print(f"   skipped: {repo['error']}", file=sys.stderr)
             continue
 
-        commands = {
-            "kazu": kazu_command(tool_paths["kazu"], path, args.workers, options),
-            "kazu-base": kazu_command(tool_paths["kazu-base"], path, args.workers, options),
-            "scc": scc_command(tool_paths["scc"], path, options),
-            "tokei": tokei_command(tool_paths["tokei"], path, options),
-            "mezura": mezura_command(tool_paths["mezura"], path, options),
-        }
-
-        parsers = {
-            "kazu": parse_kazu,
-            "kazu-base": parse_kazu,
-            "scc": parse_scc,
-            "tokei": parse_tokei,
-            "mezura": parse_mezura,
-        }
+        commands: dict[str, list[str]] = {}
+        parsers: dict[str, Any] = {}
+        for name in tools:
+            if name in kazu_tools:
+                commands[name] = kazu_command(
+                    tool_paths[name], path, args.workers, options
+                )
+                parsers[name] = parse_kazu
+            elif name == "scc":
+                commands[name] = scc_command(tool_paths[name], path, options)
+                parsers[name] = parse_scc
+            elif name == "tokei":
+                commands[name] = tokei_command(tool_paths[name], path, options)
+                parsers[name] = parse_tokei
+            else:
+                commands[name] = mezura_command(tool_paths[name], path, options)
+                parsers[name] = parse_mezura
 
         results_by_tool: dict[str, ToolResult] = {}
         for name in tools:
@@ -868,6 +966,7 @@ def main(argv: list[str]) -> int:
         options,
         generated_at,
         os.path.basename(args.svg_path) if args.svg_path else None,
+        args.descriptions,
     )
     if args.markdown_path:
         with open(args.markdown_path, "w", encoding="utf-8") as handle:

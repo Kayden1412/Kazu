@@ -36,6 +36,15 @@ on:
         required: false
         default: "0.17.1"
         type: string
+      kazu_refs:
+        description: >-
+          Space- or comma-separated kazu refs to build and time alongside the
+          checked-out commit (empty = checked-out commit only). Accepts branches,
+          tags, and full commit SHAs; each ref is built with the same Zig version
+          and appears as kazu-<short sha>.
+        required: false
+        default: ""
+        type: string
       scc_ref:
         description: Branch, tag, or commit SHA to check out for scc (empty = default branch)
         required: false
@@ -102,6 +111,47 @@ jobs:
           zig version
           zig build -Doptimize=fast
           ./zig-out/bin/kazu --version
+          sha="$(git rev-parse HEAD)"
+          : > "$RUNNER_TEMP/tool-builds.txt"
+          printf 'kazu\t%s\t%s\n' "$sha" "$(git log -1 --format=%s "$sha")" >> "$RUNNER_TEMP/tool-builds.txt"
+
+      - name: Build kazu refs
+        if: inputs.kazu_refs != ''
+        env:
+          KAZU_REFS: ${{ inputs.kazu_refs }}
+        run: |
+          set -euo pipefail
+          head_sha="$(git rev-parse HEAD)"
+          declare -A seen=()
+          read -ra refs <<< "${KAZU_REFS//,/ }"
+          for ref in "${refs[@]}"; do
+            [ -n "$ref" ] || continue
+            if ! sha="$(git rev-parse --verify "${ref}^{commit}" 2>/dev/null)"; then
+              git fetch -q --depth 1 origin "$ref"
+              sha="$(git rev-parse --verify "FETCH_HEAD^{commit}")"
+            fi
+            short="${sha:0:7}"
+            name="kazu-$short"
+            if [ -n "${seen[$name]:-}" ]; then
+              echo "skipping duplicate $name"
+              continue
+            fi
+            seen[$name]=1
+            if [ "$sha" = "$head_sha" ]; then
+              echo "skipping $ref: already the checked-out commit"
+              continue
+            fi
+            dir="$RUNNER_TEMP/kazu-src-$short"
+            echo "::group::Building $name ($ref)"
+            git worktree add --detach "$dir" "$sha"
+            (cd "$dir" && zig build -Doptimize=fast)
+            mkdir -p "$RUNNER_TEMP/kazu-variants/$name"
+            cp "$dir/zig-out/bin/kazu" "$RUNNER_TEMP/kazu-variants/$name/kazu"
+            git worktree remove --force "$dir"
+            "$RUNNER_TEMP/kazu-variants/$name/kazu" --version
+            printf '%s\t%s\t%s\n' "$name" "$sha" "$(git log -1 --format=%s "$sha")" >> "$RUNNER_TEMP/tool-builds.txt"
+            echo "::endgroup::"
+          done
 
       - name: Fetch scc
         env:
@@ -120,6 +170,8 @@ jobs:
           else
             git clone -q --depth 1 "$SCC_REPO" "$RUNNER_TEMP/scc"
           fi
+          sha="$(git -C "$RUNNER_TEMP/scc" rev-parse HEAD)"
+          printf 'scc\t%s\t%s\n' "$sha" "$(git -C "$RUNNER_TEMP/scc" log -1 --format=%s "$sha")" >> "$RUNNER_TEMP/tool-builds.txt"
 
       - name: Set up Go
         uses: actions/setup-go@v5
@@ -167,6 +219,8 @@ jobs:
           else
             git clone -q --depth 1 "$MEZURA_REPO" "$RUNNER_TEMP/mezura"
           fi
+          sha="$(git -C "$RUNNER_TEMP/mezura" rev-parse HEAD)"
+          printf 'mezura\t%s\t%s\n' "$sha" "$(git -C "$RUNNER_TEMP/mezura" log -1 --format=%s "$sha")" >> "$RUNNER_TEMP/tool-builds.txt"
           cargo build --release --bin mezura --manifest-path "$RUNNER_TEMP/mezura/Cargo.toml"
           "$RUNNER_TEMP/mezura/target/release/mezura" --version
 
@@ -177,6 +231,13 @@ jobs:
           scc --version
           tokei --version
           "$RUNNER_TEMP/mezura/target/release/mezura" --version
+          if [ -f "$RUNNER_TEMP/tool-builds.txt" ]; then
+            while IFS=$'\t' read -r name sha subject; do
+              case "$name" in
+                kazu-*) "$RUNNER_TEMP/kazu-variants/$name/kazu" --version ;;
+              esac
+            done < "$RUNNER_TEMP/tool-builds.txt"
+          fi
 
       - name: Clone repositories
         env:
@@ -261,8 +322,28 @@ jobs:
             modes+=(--no-gitignore)
           fi
 
+          kazu_args=()
+          describe_args=()
+          if [ -f "$RUNNER_TEMP/tool-builds.txt" ]; then
+            while IFS=$'\t' read -r name sha subject; do
+              [ -n "$name" ] || continue
+              short="${sha:0:7}"
+              case "$name" in
+                kazu-*)
+                  kazu_args+=(--kazu-variant "$name=$RUNNER_TEMP/kazu-variants/$name/kazu")
+                  describe_args+=(--describe "$name=$subject")
+                  ;;
+                *)
+                  describe_args+=(--describe "$name=$short $subject")
+                  ;;
+              esac
+            done < "$RUNNER_TEMP/tool-builds.txt"
+          fi
+
           python3 .github/scripts/bench.py \
             --kazu "$GITHUB_WORKSPACE/zig-out/bin/kazu" \
+            "${kazu_args[@]}" \
+            "${describe_args[@]}" \
             --scc "$(command -v scc)" \
             --tokei "$(command -v tokei)" \
             --mezura "$RUNNER_TEMP/mezura/target/release/mezura" \

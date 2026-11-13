@@ -210,9 +210,15 @@ Single-shot timings are meaningless on a shared host.
   tokei, and `--no-gitignore --no-ignore-files` for mezura. The `by_file` input
   switches all four tools to per-file output (`--by-file` for kazu/scc/mezura,
   `--files` for tokei; tokei's JSON always includes per-file reports). The
-  workflow builds scc and mezura from source (`go build` for scc and
-  `cargo build --release --bin mezura` for mezura); locally, point `--scc` /
-  `--mezura` at existing binaries instead. The driver runs mezura with
+  `kazu_refs` input builds extra kazu commits with the same Zig version in
+  detached worktrees and passes them to the driver as
+  `--kazu-variant kazu-<short sha>=<path>`; the checked-out commit stays the
+  `kazu` baseline, and every ratio is measured against it. Each tool's commit
+  SHA and subject are passed through `--describe`, so the report and job summary
+  identify the exact builds. The workflow builds scc and mezura from source
+  (`go build` for scc and `cargo build --release --bin mezura` for mezura);
+  locally, point `--scc` / `--mezura` at existing binaries instead. The driver
+  runs mezura with
   `--counting region`, `--count-minified`, `--count-generated`,
   `--count-not-code`, and `--search-in-dotted` so it uses the same line model
   and file set as the other tools. The `combined` input adds one scan of the
@@ -230,8 +236,10 @@ Single-shot timings are meaningless on a shared host.
   keys that include the commit SHA, Zig version, and strip flag, so reruns skip
   the rebuild. The driver interleaves the selected tools each
   round (forward, then reversed) and derives the report title from the tool
-  list, so a two-binary run reports `# kazu vs kazu-base`. `--kazu-base` is
-  empty by default, so the cross-tool workflow is unchanged.
+  list, so a two-binary run reports `# kazu vs kazu-base`. The head and base
+  commit short SHA and subject are passed with `--describe` and also printed in
+  the job summary's environment block. `--kazu-base` is empty by default, so the
+  cross-tool workflow is unchanged.
 
 ## Gotchas
 
