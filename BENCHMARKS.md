@@ -323,6 +323,41 @@ End-to-end the change is neutral, because file reads and counting dominate:
 Counts were identical in every run. The binary also shrank by ~13 KB, since the
 length+byte range table is smaller than a 2x-capacity open-addressed key array.
 
+### Rapidhash experiment
+
+A rapidhash-based open-addressed map was measured against the same harness
+(medians of 15 interleaved rounds; absolute `ns/call` drift between sessions, so
+compare within a row):
+
+| Microbenchmark | FNV map | `LenByteMap` | rapidhash + lowercase | rapidhash raw | rapidhash + case fold |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Mixed names | 145 | 131 | 163 | 121 | 128 |
+| Common extensions | 102 | 95 | 121 | 84 | 87 |
+| `detectBasename` | 108 | 85 | 113 | 76 | 81 |
+
+The map must be case-insensitive, so a plain rapidhash map lowercases each key
+into a stack buffer before hashing. That copy costs more than the faster mixer
+saves, leaving it 24–33% slower than `LenByteMap` and slower than the FNV map.
+Folding ASCII case into each loaded word (`| 0x20`) instead makes keys that are
+equal under `eqlIgnoreCase` hash equal with no copy, and is correct because the
+probe still finishes with `eqlIgnoreCase`. That variant is 3–8% faster than
+`LenByteMap`, but needs a vendored fork of rapidhash and is a tie end-to-end
+(LangArena 494 ms vs 492 ms over 21 rounds). `LenByteMap` stays.
+
+"rapidhash raw" hashes the key as-is and is therefore not usable for detection;
+it is listed only to separate hash cost from case-normalisation cost.
+
+### Credits
+
+- The ASCII case identity (`0x20` apart) and its SWAR form are described in
+  Henry S. Warren Jr.'s *Hacker's Delight* and in Tony Finch's
+  ["tolower() in bulk at speed"](https://dotat.at/@/2022-06-27-tolower-swar.html)
+  (2022). The rapidhash experiment uses the blanket `| 0x20` form rather than
+  the masked fold, which is safe only because it selects a bucket and the probe
+  still finishes with `eqlIgnoreCase`.
+- rapidhash V3 is by Nicolas De Carli (MIT); the Zig port used for the
+  experiment is [`baskingspot/stdx`](https://github.com/baskingspot/stdx).
+
 ## Conclusions
 
 - kazu beats scc on every measured workload: LangArena x4 0.78x, LangArena
