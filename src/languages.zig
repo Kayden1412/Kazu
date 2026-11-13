@@ -422,31 +422,105 @@ fn indexOfName(name: []const u8) ?u16 {
     return null;
 }
 
+/// Open-addressed string map built at comptime. Keys are stored as-is and
+/// compared case-insensitively, so lookups never allocate or copy the input.
+fn StaticStringHashMap(comptime V: type, comptime capacity: usize) type {
+    return struct {
+        const Self = @This();
+
+        keys: [capacity][]const u8 = @splat(@as([]const u8, "")),
+        values: [capacity]V = @splat(0),
+
+        fn slot(key: []const u8) usize {
+            var h: u64 = 0xcbf29ce484222325;
+            for (key) |c| {
+                h ^= std.ascii.toLower(c);
+                h *%= 0x100000001b3;
+            }
+            return @intCast(h & (capacity - 1));
+        }
+
+        /// Inserts the first value seen for a key; later duplicates are ignored
+        /// so the language table's top-down precedence is preserved.
+        fn put(self: *Self, key: []const u8, value: V) void {
+            var i = slot(key);
+            while (self.keys[i].len != 0) {
+                if (std.ascii.eqlIgnoreCase(self.keys[i], key)) return;
+                i = (i + 1) & (capacity - 1);
+            }
+            self.keys[i] = key;
+            self.values[i] = value;
+        }
+
+        fn get(self: *const Self, key: []const u8) ?V {
+            if (key.len == 0) return null;
+            var i = slot(key);
+            while (self.keys[i].len != 0) {
+                if (std.ascii.eqlIgnoreCase(self.keys[i], key)) return self.values[i];
+                i = (i + 1) & (capacity - 1);
+            }
+            return null;
+        }
+    };
+}
+
+fn mapCapacity(comptime n: usize) usize {
+    var cap: usize = 1;
+    while (cap < n * 2) cap *= 2;
+    return cap;
+}
+
+const extension_count = blk: {
+    var n: usize = 0;
+    for (languages) |lang| n += lang.extensions.len;
+    break :blk n;
+};
+
+const filename_count = blk: {
+    var n: usize = 0;
+    for (languages) |lang| n += lang.filenames.len;
+    break :blk n;
+};
+
+const ExtensionMap = StaticStringHashMap(u16, mapCapacity(extension_count));
+const FilenameMap = StaticStringHashMap(u16, mapCapacity(filename_count));
+
+/// Extension lookup table built at comptime. Duplicate extensions keep the
+/// first language that claimed them, matching the table's precedence.
+const extension_map = blk: {
+    @setEvalBranchQuota(10_000_000);
+    var map = ExtensionMap{};
+    for (languages, 0..) |lang, lang_index| {
+        for (lang.extensions) |ext| map.put(ext, @intCast(lang_index));
+    }
+    break :blk map;
+};
+
+/// Filename lookup table built at comptime. As with extensions, the first
+/// language that claims a filename wins.
+const filename_map = blk: {
+    @setEvalBranchQuota(10_000_000);
+    var map = FilenameMap{};
+    for (languages, 0..) |lang, lang_index| {
+        for (lang.filenames) |filename| map.put(filename, @intCast(lang_index));
+    }
+    break :blk map;
+};
+
 /// Look up a language by file name (basename only).
 pub fn byFilename(name: []const u8) ?u16 {
-    for (languages, 0..) |lang, i| {
-        for (lang.filenames) |candidate| {
-            if (std.ascii.eqlIgnoreCase(name, candidate)) return @intCast(i);
-        }
-    }
-    return null;
+    return filename_map.get(name);
 }
 
 /// Look up a language by extension, with or without a leading dot.
 pub fn byExtension(ext_in: []const u8) ?u16 {
     const ext = if (ext_in.len > 0 and ext_in[0] == '.') ext_in[1..] else ext_in;
     if (ext.len == 0) return null;
-    for (languages, 0..) |lang, i| {
-        for (lang.extensions) |candidate| {
-            if (std.ascii.eqlIgnoreCase(ext, candidate)) return @intCast(i);
-        }
-    }
-    return null;
+    return extension_map.get(ext);
 }
 
-/// Detect a language from a path or bare file name.
-pub fn detectName(path: []const u8) ?u16 {
-    const name = std.fs.path.basename(path);
+/// Detect a language from a bare file name.
+pub fn detectBasename(name: []const u8) ?u16 {
     if (byFilename(name)) |idx| return idx;
 
     // Try the longest suffix first so compound extensions such as `d.ts`,
@@ -459,6 +533,11 @@ pub fn detectName(path: []const u8) ?u16 {
         start = dot + 1;
     }
     return null;
+}
+
+/// Detect a language from a path or bare file name.
+pub fn detectName(path: []const u8) ?u16 {
+    return detectBasename(std.fs.path.basename(path));
 }
 
 const Interpreter = struct {
@@ -538,6 +617,8 @@ test "detect by extension and filename" {
     try std.testing.expectEqual(indexOfName("Dockerfile").?, detectName("Dockerfile").?);
     try std.testing.expectEqual(indexOfName("CMake").?, detectName("CMakeLists.txt").?);
     try std.testing.expectEqual(indexOfName("Starlark").?, detectName("BUILD.bazel").?);
+    try std.testing.expectEqual(indexOfName("Zig").?, detectName("SRC/MAIN.ZIG").?);
+    try std.testing.expectEqual(indexOfName("Makefile").?, detectName("MAKEFILE").?);
     try std.testing.expect(detectName("README") == null);
     try std.testing.expect(detectName("picture.png") == null);
 }

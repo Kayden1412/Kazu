@@ -113,7 +113,11 @@ This is the most edit-prone file. Preserve these invariants:
 - `detectName` tries the filename first, then the **longest** dotted suffix
   first, so compound extensions (`d.ts`, `blade.php`, `vcxproj.filters`,
   `cs.st`) beat their final component. Do not replace it with
-  `std.fs.path.extension`.
+  `std.fs.path.extension`. `detectBasename` is the same logic for callers that
+  already hold a basename; the walker uses it to avoid recomputing the basename.
+- Filename and extension lookups use comptime open-addressed hash maps built
+  from the table. Duplicate keys keep the first language, preserving top-down
+  precedence.
 - Two tests guard the table and must keep passing:
   - `every language has a detection rule` — each entry needs an extension or a
     filename.

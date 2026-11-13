@@ -914,7 +914,7 @@ fn queueFile(
         return false;
     }
 
-    const lang = languages.detectName(name);
+    const lang = languages.detectBasename(name);
     if (lang == null and !canHaveShebang(name)) {
         gpa.free(path);
         return false;
