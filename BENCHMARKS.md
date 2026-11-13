@@ -341,8 +341,9 @@ saves, leaving it 24–33% slower than `LenByteMap` and slower than the FNV map.
 Folding ASCII case into each loaded word (`| 0x20`) instead makes keys that are
 equal under `eqlIgnoreCase` hash equal with no copy, and is correct because the
 probe still finishes with `eqlIgnoreCase`. That variant is 3–8% faster than
-`LenByteMap`, but needs a vendored fork of rapidhash and is a tie end-to-end
-(LangArena 494 ms vs 492 ms over 21 rounds). `LenByteMap` stays.
+`LenByteMap`, but end-to-end it is a tie (LangArena 494 ms vs 492 ms over 21
+rounds). The faster lookup path was kept anyway; `kazu` now vendors the trimmed
+hash as `src/rapidhash.zig` (MIT), with only `hashFold` reachable.
 
 "rapidhash raw" hashes the key as-is and is therefore not usable for detection;
 it is listed only to separate hash cost from case-normalisation cost.
@@ -352,11 +353,11 @@ it is listed only to separate hash cost from case-normalisation cost.
 - The ASCII case identity (`0x20` apart) and its SWAR form are described in
   Henry S. Warren Jr.'s *Hacker's Delight* and in Tony Finch's
   ["tolower() in bulk at speed"](https://dotat.at/@/2022-06-27-tolower-swar.html)
-  (2022). The rapidhash experiment uses the blanket `| 0x20` form rather than
+  (2022). The language map uses the blanket `| 0x20` form rather than
   the masked fold, which is safe only because it selects a bucket and the probe
   still finishes with `eqlIgnoreCase`.
-- rapidhash V3 is by Nicolas De Carli (MIT); the Zig port used for the
-  experiment is [`baskingspot/stdx`](https://github.com/baskingspot/stdx).
+- rapidhash V3 is by Nicolas De Carli (MIT); the Zig port adapted here is
+  [`baskingspot/stdx`](https://github.com/baskingspot/stdx).
 
 ## Conclusions
 

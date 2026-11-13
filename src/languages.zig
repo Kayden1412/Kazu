@@ -422,141 +422,54 @@ fn indexOfName(name: []const u8) ?u16 {
     return null;
 }
 
-/// Two-level comptime lookup table: length first, then a discriminator byte
-/// chosen per length to keep the remaining candidates small. Keys are compared
-/// case-insensitively, so lookups never allocate or copy the input.
-fn LenByteMap(comptime V: type, comptime entries: anytype) type {
-    const n = entries.len;
-    const stride = 257;
-    const Offset = if (n < 256) u8 else u16;
+const rapidhash = @import("rapidhash.zig");
 
-    const min_len = blk: {
-        @setEvalBranchQuota(10_000_000);
-        var m: usize = std.math.maxInt(usize);
-        for (entries) |entry| m = @min(m, entry[0].len);
-        break :blk m;
-    };
-    const max_len = blk: {
-        @setEvalBranchQuota(10_000_000);
-        var m: usize = 0;
-        for (entries) |entry| m = @max(m, entry[0].len);
-        break :blk m;
-    };
-
-    // Best discriminator position for each length: the one that minimizes the
-    // sum of squared bucket sizes, i.e. the expected linear scan length.
-    const pos: [max_len + 1]u8 = blk: {
-        @setEvalBranchQuota(10_000_000);
-        var p: [max_len + 1]u8 = @splat(0);
-        var len: usize = min_len;
-        while (len <= max_len) : (len += 1) {
-            var count: usize = 0;
-            for (entries) |entry| {
-                if (entry[0].len == len) count += 1;
-            }
-            if (count <= 1) continue;
-
-            var best_pos: usize = 0;
-            var best_score: usize = std.math.maxInt(usize);
-            var cand: usize = 0;
-            while (cand < len) : (cand += 1) {
-                var groups: [256]u16 = @splat(0);
-                for (entries) |entry| {
-                    if (entry[0].len == len) {
-                        groups[std.ascii.toLower(entry[0][cand])] += 1;
-                    }
-                }
-                var score: usize = 0;
-                for (groups) |g| score += @as(usize, g) * g;
-                if (score < best_score) {
-                    best_score = score;
-                    best_pos = cand;
-                }
-            }
-            p[len] = @intCast(best_pos);
-        }
-        break :blk p;
-    };
-
-    const Helpers = struct {
-        fn less(a: usize, b: usize) bool {
-            const ka = entries[a][0];
-            const kb = entries[b][0];
-            if (ka.len != kb.len) return ka.len < kb.len;
-            const pa = std.ascii.toLower(ka[pos[ka.len]]);
-            const pb = std.ascii.toLower(kb[pos[kb.len]]);
-            if (pa != pb) return pa < pb;
-            switch (std.mem.order(u8, ka, kb)) {
-                .lt => return true,
-                .gt => return false,
-                .eq => return a < b,
-            }
-        }
-    };
-
-    const Sorted = struct {
-        keys: [n][]const u8,
-        vals: [n]V,
-        /// Row `len` maps byte value b to the first key with that length and a
-        /// discriminator byte >= b (b == 256 is the row end sentinel).
-        starts: [(max_len + 1) * stride]Offset,
-    };
-
-    const sorted: Sorted = blk: {
-        @setEvalBranchQuota(10_000_000);
-        var order: [n]usize = undefined;
-        for (0..n) |i| order[i] = i;
-
-        var i: usize = 1;
-        while (i < n) : (i += 1) {
-            const cur = order[i];
-            var j = i;
-            while (j > 0 and Helpers.less(cur, order[j - 1])) : (j -= 1) {
-                order[j] = order[j - 1];
-            }
-            order[j] = cur;
-        }
-
-        var keys: [n][]const u8 = undefined;
-        var vals: [n]V = undefined;
-        for (order, 0..) |idx, p| {
-            keys[p] = entries[idx][0];
-            vals[p] = entries[idx][1];
-        }
-
-        var starts: [(max_len + 1) * stride]Offset = undefined;
-        var p: usize = 0;
-        var len: usize = 0;
-        while (len <= max_len) : (len += 1) {
-            var b: usize = 0;
-            while (b <= 256) : (b += 1) {
-                while (p < n) {
-                    const k = keys[p];
-                    if (k.len > len) break;
-                    if (k.len == len and std.ascii.toLower(k[pos[len]]) >= b) break;
-                    p += 1;
-                }
-                starts[len * stride + b] = @intCast(p);
-            }
-        }
-
-        break :blk .{ .keys = keys, .vals = vals, .starts = starts };
-    };
-
+/// Open-addressed string map built at comptime. Keys are stored as-is and
+/// compared case-insensitively; `hashFold` folds ASCII case into the hash, so
+/// lookups never allocate or copy the key.
+fn RapidStringHashMap(
+    comptime V: type,
+    comptime capacity: usize,
+    comptime max_key_len: usize,
+) type {
     return struct {
-        pub fn get(key: []const u8) ?V {
-            if (key.len < min_len or key.len > max_len) return null;
-            const len = key.len;
-            const b: usize = std.ascii.toLower(key[pos[len]]);
-            const row = len * stride;
-            var i: usize = sorted.starts[row + b];
-            const end: usize = sorted.starts[row + b + 1];
-            while (i < end) : (i += 1) {
-                if (std.ascii.eqlIgnoreCase(key, sorted.keys[i])) return sorted.vals[i];
+        const Self = @This();
+
+        keys: [capacity][]const u8 = @splat(@as([]const u8, "")),
+        values: [capacity]V = @splat(0),
+
+        fn slot(key: []const u8) usize {
+            return @intCast(rapidhash.hashFold(key) & (capacity - 1));
+        }
+
+        /// Inserts the first value seen for a key; later duplicates are ignored
+        /// so the language table's top-down precedence is preserved.
+        fn put(self: *Self, key: []const u8, value: V) void {
+            var i = slot(key);
+            while (self.keys[i].len != 0) {
+                if (std.ascii.eqlIgnoreCase(self.keys[i], key)) return;
+                i = (i + 1) & (capacity - 1);
+            }
+            self.keys[i] = key;
+            self.values[i] = value;
+        }
+
+        fn get(self: *const Self, key: []const u8) ?V {
+            if (key.len == 0 or key.len > max_key_len) return null;
+            var i = slot(key);
+            while (self.keys[i].len != 0) {
+                if (std.ascii.eqlIgnoreCase(self.keys[i], key)) return self.values[i];
+                i = (i + 1) & (capacity - 1);
             }
             return null;
         }
     };
+}
+
+fn mapCapacity(comptime n: usize) usize {
+    var cap: usize = 1;
+    while (cap < n * 2) cap *= 2;
+    return cap;
 }
 
 const extension_count = blk: {
@@ -571,48 +484,59 @@ const filename_count = blk: {
     break :blk n;
 };
 
-const extension_entries = blk: {
-    var entries: [extension_count]struct { []const u8, u16 } = undefined;
-    var n: usize = 0;
-    for (languages, 0..) |lang, lang_index| {
-        for (lang.extensions) |ext| {
-            entries[n] = .{ ext, @intCast(lang_index) };
-            n += 1;
-        }
+const extension_max_len = blk: {
+    @setEvalBranchQuota(10_000_000);
+    var m: usize = 0;
+    for (languages) |lang| {
+        for (lang.extensions) |ext| m = @max(m, ext.len);
     }
-    break :blk entries;
+    break :blk m;
 };
 
-const filename_entries = blk: {
-    var entries: [filename_count]struct { []const u8, u16 } = undefined;
-    var n: usize = 0;
-    for (languages, 0..) |lang, lang_index| {
-        for (lang.filenames) |filename| {
-            entries[n] = .{ filename, @intCast(lang_index) };
-            n += 1;
-        }
+const filename_max_len = blk: {
+    @setEvalBranchQuota(10_000_000);
+    var m: usize = 0;
+    for (languages) |lang| {
+        for (lang.filenames) |filename| m = @max(m, filename.len);
     }
-    break :blk entries;
+    break :blk m;
 };
+
+const ExtensionMap = RapidStringHashMap(u16, mapCapacity(extension_count), extension_max_len);
+const FilenameMap = RapidStringHashMap(u16, mapCapacity(filename_count), filename_max_len);
 
 /// Extension lookup table built at comptime. Duplicate extensions keep the
 /// first language that claimed them, matching the table's precedence.
-const ExtensionMap = LenByteMap(u16, extension_entries);
+const extension_map = blk: {
+    @setEvalBranchQuota(10_000_000);
+    var map = ExtensionMap{};
+    for (languages, 0..) |lang, lang_index| {
+        for (lang.extensions) |ext| map.put(ext, @intCast(lang_index));
+    }
+    break :blk map;
+};
 
 /// Filename lookup table built at comptime. As with extensions, the first
 /// language that claims a filename wins.
-const FilenameMap = LenByteMap(u16, filename_entries);
+const filename_map = blk: {
+    @setEvalBranchQuota(10_000_000);
+    var map = FilenameMap{};
+    for (languages, 0..) |lang, lang_index| {
+        for (lang.filenames) |filename| map.put(filename, @intCast(lang_index));
+    }
+    break :blk map;
+};
 
 /// Look up a language by file name (basename only).
 pub fn byFilename(name: []const u8) ?u16 {
-    return FilenameMap.get(name);
+    return filename_map.get(name);
 }
 
 /// Look up a language by extension, with or without a leading dot.
 pub fn byExtension(ext_in: []const u8) ?u16 {
     const ext = if (ext_in.len > 0 and ext_in[0] == '.') ext_in[1..] else ext_in;
     if (ext.len == 0) return null;
-    return ExtensionMap.get(ext);
+    return extension_map.get(ext);
 }
 
 /// Detect a language from a bare file name.
@@ -748,17 +672,6 @@ test "detect languages added from scc" {
     try std.testing.expectEqual(indexOfName("Zig").?, detectName("src/main.zig").?);
 }
 
-test "every extension and filename maps to its language" {
-    for (languages, 0..) |lang, i| {
-        for (lang.extensions) |ext| {
-            try std.testing.expectEqual(@as(u16, @intCast(i)), byExtension(ext).?);
-        }
-        for (lang.filenames) |filename| {
-            try std.testing.expectEqual(@as(u16, @intCast(i)), byFilename(filename).?);
-        }
-    }
-}
-
 test "every language has a detection rule" {
     for (languages) |lang| {
         try std.testing.expect(lang.extensions.len > 0 or lang.filenames.len > 0);
@@ -781,6 +694,23 @@ test "language table has unique extensions" {
             if (entry.found_existing) {
                 return error.DuplicateExtension;
             }
+        }
+    }
+}
+
+test "every extension and filename maps to its language" {
+    for (languages, 0..) |lang, i| {
+        for (lang.extensions) |ext| {
+            try std.testing.expectEqual(@as(u16, @intCast(i)), byExtension(ext).?);
+            var buf: [64]u8 = undefined;
+            const upper = std.ascii.upperString(&buf, ext);
+            try std.testing.expectEqual(@as(u16, @intCast(i)), byExtension(upper).?);
+        }
+        for (lang.filenames) |filename| {
+            try std.testing.expectEqual(@as(u16, @intCast(i)), byFilename(filename).?);
+            var buf: [64]u8 = undefined;
+            const upper = std.ascii.upperString(&buf, filename);
+            try std.testing.expectEqual(@as(u16, @intCast(i)), byFilename(upper).?);
         }
     }
 }

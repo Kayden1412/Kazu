@@ -39,6 +39,7 @@ validate library changes. Host-specific notes live in `ENVIRONMENT.local.md`
 | `src/main.zig` | CLI parsing, selective `std.Io` directory walk, `.gitignore` / `.ignore` integration, batched `std.Io` workers |
 | `src/root.zig` | Public module; re-exports the pure modules and pulls in their tests |
 | `src/languages.zig` | Language table plus filename/extension/shebang detection |
+| `src/rapidhash.zig` | Vendored rapidhash V3 case-folded hash used by the language map |
 | `src/count.zig` | Line classification and counting |
 | `src/gitignore.zig` | `.gitignore` / `.ignore` parser and path matcher |
 | `src/format.zig` | Table, JSON, Markdown, HTML, and ZON renderers |
@@ -115,16 +116,18 @@ This is the most edit-prone file. Preserve these invariants:
   `cs.st`) beat their final component. Do not replace it with
   `std.fs.path.extension`. `detectBasename` is the same logic for callers that
   already hold a basename; the walker uses it to avoid recomputing the basename.
-- Filename and extension lookups use a comptime `LenByteMap`: entries are
-  grouped by key length, then sorted by a discriminator byte whose position is
-  chosen per length to minimise bucket sizes. Lookups index a per-length range
-  table and scan a handful of candidates with `std.ascii.eqlIgnoreCase`, so no
-  hashing or allocation happens. Duplicate keys keep the first language,
-  preserving top-down precedence.
-- Two tests guard the table and must keep passing:
+- Filename and extension lookups use a comptime open-addressed map keyed by
+  `rapidhash.hashFold`: the hash folds ASCII case into each loaded word, and
+  every probe finishes with `std.ascii.eqlIgnoreCase`, so lookups never
+  allocate or copy the key. Duplicate keys keep the first language, preserving
+  top-down precedence. `src/rapidhash.zig` is a trimmed, vendored rapidhash V3
+  (MIT) that keeps only `hashFold` and its helpers.
+- Tests guard the table and must keep passing:
   - `every language has a detection rule` — each entry needs an extension or a
     filename.
   - `language table has unique extensions` — no extension may be claimed twice.
+  - `every extension and filename maps to its language` — every key resolves to
+    its entry, including when the input is uppercase.
 - When two `scc` languages share an extension, keep the language `kazu` already
   assigns and merge the remaining extensions into it rather than adding a
   duplicate. Current decisions: `m` → Objective-C, `h` → C, `ts` → TypeScript,

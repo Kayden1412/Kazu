@@ -294,6 +294,7 @@ zig build test
 ## Layout
 
 - `src/languages.zig` - language table, extension/filename/shebang detection
+- `src/rapidhash.zig` - vendored rapidhash V3 case-folded hash used by the language map
 - `src/count.zig` - line classification and counting
 - `src/gitignore.zig` - `.gitignore` / `.ignore` parsing and path matching
 - `src/format.zig` - table, JSON, Markdown, HTML, and ZON renderers
