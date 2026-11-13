@@ -294,6 +294,35 @@ ordinary code bytes, plus fast skips for line comments, forced-code lines,
 string bodies, and block bodies. Remaining limits are per-line overhead
 (~24 ns/line) and string-heavy minified code.
 
+## Language detection
+
+Detection runs once per walked file, so it is a small share of a tree scan, but
+it is pure CPU work on the walker thread and showed up in profiles. Two
+comptime lookup designs were compared with the same ReleaseFast harness
+(interleaved, 5 runs each, medians):
+
+| Microbenchmark | Hash map | `LenByteMap` | Ratio |
+| --- | ---: | ---: | ---: |
+| Mixed names (27, incl. compound extensions) | 158 ns/call | 144 ns/call | 0.91x |
+| Common extensions only (16 names) | 118 ns/call | 108 ns/call | 0.92x |
+| `detectBasename` over mixed names | 119 ns/call | 95 ns/call | 0.80x |
+
+The hash map uses FNV-1a over lowercased bytes. `LenByteMap` instead dispatches
+on key length, then on a discriminator byte whose position is chosen per length
+to minimise bucket sizes, and scans the remaining candidates with
+`std.ascii.eqlIgnoreCase`. Both preserve case-insensitive, first-match-wins
+semantics without allocating.
+
+End-to-end the change is neutral, because file reads and counting dominate:
+
+| Workload | Hash map | `LenByteMap` | Ratio |
+| --- | ---: | ---: | ---: |
+| LangArena (960 files, 31 rounds) | 495 ms | 495 ms | 1.00x |
+| `detbench` (20k tiny files, 5 rounds) | 7.49 s | 7.34 s | 0.98x |
+
+Counts were identical in every run. The binary also shrank by ~13 KB, since the
+length+byte range table is smaller than a 2x-capacity open-addressed key array.
+
 ## Conclusions
 
 - kazu beats scc on every measured workload: LangArena x4 0.78x, LangArena

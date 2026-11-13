@@ -115,9 +115,12 @@ This is the most edit-prone file. Preserve these invariants:
   `cs.st`) beat their final component. Do not replace it with
   `std.fs.path.extension`. `detectBasename` is the same logic for callers that
   already hold a basename; the walker uses it to avoid recomputing the basename.
-- Filename and extension lookups use comptime open-addressed hash maps built
-  from the table. Duplicate keys keep the first language, preserving top-down
-  precedence.
+- Filename and extension lookups use a comptime `LenByteMap`: entries are
+  grouped by key length, then sorted by a discriminator byte whose position is
+  chosen per length to minimise bucket sizes. Lookups index a per-length range
+  table and scan a handful of candidates with `std.ascii.eqlIgnoreCase`, so no
+  hashing or allocation happens. Duplicate keys keep the first language,
+  preserving top-down precedence.
 - Two tests guard the table and must keep passing:
   - `every language has a detection rule` — each entry needs an extension or a
     filename.
