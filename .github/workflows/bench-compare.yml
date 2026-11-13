@@ -126,6 +126,12 @@ jobs:
           mkdir -p "$RUNNER_TEMP/kazu-head"
           cp zig-out/bin/kazu "$RUNNER_TEMP/kazu-head/kazu"
 
+      - name: Build benchmark driver
+        run: |
+          set -euo pipefail
+          zig build bench -Doptimize=fast -Dstrip
+          ./zig-out/bin/bench --help > /dev/null
+
       - name: Build base kazu
         if: steps.cache-base.outputs.cache-hit != 'true'
         env:
@@ -244,7 +250,7 @@ jobs:
           base_short="${base_sha:0:7}"
           base_subject="$(cat "$RUNNER_TEMP/base-subject.txt")"
 
-          python3 .github/scripts/bench.py \
+          ./zig-out/bin/bench \
             --kazu "$RUNNER_TEMP/kazu-head/kazu" \
             --kazu-base "$RUNNER_TEMP/kazu-base/kazu" \
             --describe "kazu=$head_short $head_subject" \

@@ -31,6 +31,29 @@ Build:
 zig build -Doptimize=fast
 ```
 
+The cross-tool results below predate the Zig benchmark driver; the original
+harness was `.github/scripts/bench.py`. The driver is now `bench/bench.zig`
+(`zig build bench`), with the same flags and the same interleaved, median-based
+method. It is written in Zig specifically so peak RSS is trustworthy; see
+[Peak RSS measurement](#peak-rss-measurement-2026-11-13).
+
+## Peak RSS measurement (2026-11-13)
+
+`ru_maxrss` for a forked child includes the resident pages it inherits from its
+parent, so the measuring process sets a floor for every tool it spawns. The
+Python driver sat at ~385 MiB RSS and reported ~8.3 MiB even for `/bin/true`;
+on LangArena that floor pinned kazu, tokei, and mezura to the same 12.3 MiB.
+`bench/bench.zig` streams each tool's JSON instead of buffering it, which keeps
+a Zig parent near 0.8 MiB and separates the tools again.
+
+Measured with the Zig driver on the same host and binaries (interleaved,
+`taskset -c 0-3`, `--workers 4`, `--no-gitignore`):
+
+| Workload | kazu | scc | tokei | mezura | Python driver, same tree |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `kazu src` (7 files, 7 rounds) | 2.9 MiB | 19.5 MiB | 6.3 MiB | 7.0 MiB | 12.5 MiB for kazu, tokei, and mezura |
+| LangArena (765 files, 7 rounds) | 2.4 MiB | 30.1 MiB | 9.5 MiB | 8.4 MiB | 12.3 MiB for kazu, tokei, and mezura |
+
 ## kazu vs scc 4.1.0
 
 | Workload | kazu | scc | kazu/scc wall | kazu CPU | scc CPU |

@@ -236,7 +236,7 @@ the job summary and uploaded as `bench-compare.*`; it lists both commits' short
 SHA and subject. Locally, the same comparison uses `--kazu` and `--kazu-base`:
 
 ```sh
-python3 .github/scripts/bench.py \
+./zig-out/bin/bench \
   --kazu ./zig-out/bin/kazu --kazu-base /path/to/base/kazu \
   --scc "" --tokei "" --mezura "" \
   --repo "kazu=$PWD" --rounds 7 --markdown compare.md
@@ -248,17 +248,18 @@ the same cloc/tokei/scc line model and counts the files the other tools count;
 `--no-default-config --no-local` keep machine and project settings out. If you
 already built mezura locally, point the driver at its binary and skip the build.
 
-The same driver runs locally. Pass the parent directory of the checkouts as an
-extra `--repo` entry to reproduce the combined run:
+The same driver runs locally; build it with `zig build bench`. Pass the parent
+directory of the checkouts as an extra `--repo` entry to reproduce the combined
+run:
 
 ```sh
-python3 .github/scripts/bench.py \
+./zig-out/bin/bench \
   --kazu ./zig-out/bin/kazu --scc scc --tokei tokei \
   --mezura /root/mezura/target/release/mezura \
   --repo "kazu=$PWD" --rounds 7 --markdown results.md
 
 # time extra kazu builds in the same interleaved run
-python3 .github/scripts/bench.py \
+./zig-out/bin/bench \
   --kazu ./zig-out/bin/kazu \
   --kazu-variant kazu-abc1234=/srv/kazu/abc1234/kazu \
   --kazu-variant kazu-def5678=/srv/kazu/def5678/kazu \
@@ -267,7 +268,7 @@ python3 .github/scripts/bench.py \
   --repo "kazu=$PWD" --rounds 7 --markdown variants.md
 
 # per-repository rows plus one row that scans all checkouts at once
-python3 .github/scripts/bench.py \
+./zig-out/bin/bench \
   --kazu ./zig-out/bin/kazu --scc scc --tokei tokei \
   --mezura /root/mezura/target/release/mezura \
   --repo "linux=/srv/repos/linux" \
@@ -302,4 +303,4 @@ zig build test
 - `src/root.zig` - public library module
 - `.github/workflows/bench.yml` - manual `kazu` vs `scc` vs `tokei` vs `mezura` benchmark workflow
 - `.github/workflows/bench-compare.yml` - manual current-vs-base `kazu` benchmark workflow
-- `.github/scripts/bench.py` - interleaved benchmark driver used by the workflow
+- `bench/bench.zig` - interleaved benchmark driver used by the workflow, built with `zig build bench`

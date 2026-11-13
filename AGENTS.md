@@ -21,16 +21,19 @@ per-language totals.
 | Run | `./zig-out/bin/kazu .` |
 | Fast test loop | `zig test src/root.zig` |
 | Full test step | `zig build test` |
-| Format | `zig fmt src/*.zig build.zig` |
-| Format check | `zig fmt --check src/*.zig build.zig` |
+| Build benchmark driver | `zig build bench` |
+| Format | `zig fmt src/*.zig bench/*.zig build.zig` |
+| Format check | `zig fmt --check src/*.zig bench/*.zig build.zig` |
 
 Native `zig build` works on Termux; no target override is needed now that the
 `zio` dependency is gone. `zig test src/root.zig` is the quickest way to
 validate library changes. Host-specific notes live in `ENVIRONMENT.local.md`
 (local, gitignored).
 
-`zig build test` builds two test executables: one for the library module
-(`src/root.zig`) and one for the CLI module (`src/main.zig`). Both must pass.
+`zig build test` builds three test executables: one for the library module
+(`src/root.zig`), one for the CLI module (`src/main.zig`), and one for the
+benchmark driver (`bench/bench.zig`). All must pass. `zig build bench` installs
+the driver as `zig-out/bin/bench`; the default install step does not build it.
 
 ## Layout
 
@@ -44,8 +47,9 @@ validate library changes. Host-specific notes live in `ENVIRONMENT.local.md`
 | `src/gitignore.zig` | `.gitignore` / `.ignore` parser and path matcher |
 | `src/format.zig` | Table, JSON, Markdown, HTML, and ZON renderers |
 | `README.md` | User-facing docs: flags, output formats, counting rules |
+| `bench/bench.zig` | Interleaved benchmark driver used by the workflows; built with `zig build bench` |
 | `.github/workflows/bench.yml` | Manual benchmark workflow: `kazu` vs `scc` vs `tokei` vs `mezura` |
-| `.github/scripts/bench.py` | Interleaved benchmark driver used by the workflow |
+| `.github/workflows/bench-compare.yml` | Manual current-vs-base `kazu` benchmark workflow |
 
 ## Data flow
 
@@ -197,6 +201,13 @@ Single-shot timings are meaningless on a shared host.
 
 - Prefer an **interleaved** driver: alternate the commands each round and
   report medians, so drift affects every tool equally.
+- `bench/bench.zig` is that driver (`zig build bench`). It must stay small and
+  must not buffer a tool's JSON: a child inherits the parent's resident pages
+  and `ru_maxrss` counts them, so a large measuring process hides the run's
+  real peak. The previous Python implementation added ~10 MiB of inherited RSS,
+  which pinned `kazu`, `tokei`, and `mezura` to the same reported floor; the
+  Zig driver reports 2.4 MiB, 9.5 MiB, and 8.4 MiB for the same binary set on
+  LangArena. Keep the streaming JSON parsers for the same reason.
 - See `ENVIRONMENT.local.md` (local, gitignored) for this machine's CPU
   topology, throttling behaviour, and sandbox quirks.
 - `hyperfine -S --warmup 5 --runs 50` is a useful cross-check. `-S` is required
@@ -232,13 +243,13 @@ Single-shot timings are meaningless on a shared host.
   `--count-not-code`, and `--search-in-dotted` so it uses the same line model
   and file set as the other tools. The `combined` input adds one scan of the
   clone parent, so the tools are also measured on a single large tree.
-  `bench.py --svg` writes a grouped peak-RSS bar chart; the workflow attaches
+  `bench --svg` writes a grouped peak-RSS bar chart; the workflow attaches
   it as `bench-memory.svg` and also renders a text bar chart in the Markdown
   report (GitHub strips inline SVG from Markdown).
 - `.github/workflows/bench-compare.yml` is the head-vs-base comparison for
   `kazu` alone. It accepts the same repository/round/worker/toggle inputs plus
   `base_ref` (default `HEAD^`), builds the head and a detached-worktree build of
-  the base with the same Zig version, and passes both binaries to `bench.py` via
+  the base with the same Zig version, and passes both binaries to `bench` via
   `--kazu` and `--kazu-base`. Both builds use `-Dstrip` to keep the binaries
   small; the base build falls back to no strip when the older commit does not
   define the option. The built binaries are cached with `actions/cache` under
