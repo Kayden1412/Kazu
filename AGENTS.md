@@ -21,7 +21,7 @@ per-language totals.
 | Run | `./zig-out/bin/kazu .` |
 | Fast test loop | `zig test src/root.zig` |
 | Full test step | `zig build test` |
-| Build benchmark driver | `zig build bench` |
+| Build benchmark driver | `zig build bench` (Debug) / `zig build bench -Doptimize=fast` (measure) |
 | Format | `zig fmt src/*.zig bench/*.zig build.zig` |
 | Format check | `zig fmt --check src/*.zig bench/*.zig build.zig` |
 
@@ -47,7 +47,7 @@ the driver as `zig-out/bin/bench`; the default install step does not build it.
 | `src/gitignore.zig` | `.gitignore` / `.ignore` parser and path matcher |
 | `src/format.zig` | Table, JSON, Markdown, HTML, and ZON renderers |
 | `README.md` | User-facing docs: flags, output formats, counting rules |
-| `bench/bench.zig` | Interleaved benchmark driver used by the workflows; built with `zig build bench` |
+| `bench/bench.zig` | Interleaved benchmark driver used by the workflows; built with `zig build bench -Doptimize=fast` |
 | `.github/workflows/bench.yml` | Manual benchmark workflow: `kazu` vs `scc` vs `tokei` vs `mezura` |
 | `.github/workflows/bench-compare.yml` | Manual current-vs-base `kazu` benchmark workflow |
 
@@ -206,8 +206,17 @@ Single-shot timings are meaningless on a shared host.
   and `ru_maxrss` counts them, so a large measuring process hides the run's
   real peak. The previous Python implementation added ~10 MiB of inherited RSS,
   which pinned `kazu`, `tokei`, and `mezura` to the same reported floor; the
-  Zig driver reports 2.4 MiB, 9.5 MiB, and 8.4 MiB for the same binary set on
+  Zig driver reports 1.9 MiB, 9.3 MiB, and 8.3 MiB for the same binary set on
   LangArena. Keep the streaming JSON parsers for the same reason.
+- Record numbers only with `zig build bench -Doptimize=fast`. The Debug driver
+  does the same work but slower and with more resident pages: it adds 1–2 ms to
+  a small run and ~1 MiB to every child's reported peak (kazu read 2.9 MiB
+  instead of 2.1 MiB on LangArena). The driver warns when it is a Debug build.
+- The watchdog is armed in two steps so the thread spawn is outside the timed
+  window: `start` spawns the thread before the clock starts, `arm` hands it the
+  pid and deadline after the child exists. Thread spawn costs 1–3 ms here, which
+  would otherwise be charged to every tool. It waits on an `Io.Event` with a
+  `Timeout` rather than polling, so a finished run wakes it immediately.
 - See `ENVIRONMENT.local.md` (local, gitignored) for this machine's CPU
   topology, throttling behaviour, and sandbox quirks.
 - `hyperfine -S --warmup 5 --runs 50` is a useful cross-check. `-S` is required

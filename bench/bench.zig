@@ -1,5 +1,6 @@
 //! Interleaved benchmark driver comparing kazu, scc, tokei, and mezura.
-//! Build it with `zig build bench`.
+//! Build it with `zig build bench`; use `-Doptimize=fast` when recording
+//! numbers, since a Debug driver inflates both wall clock and inherited RSS.
 //!
 //! Every timed run spawns the tool directly with stdout and stderr discarded,
 //! so the measured wall clock includes process startup but not a shell. Each
@@ -41,10 +42,6 @@ const version_timeout_s: f64 = 60.0;
 /// driver never holds a tool's whole report in memory.
 const read_buffer_size: usize = 64 * 1024;
 const max_json_depth: usize = 128;
-/// The watchdog re-checks `done` this often, so a finished run waits at most
-/// one slice for the watchdog thread to exit. That wait happens after the
-/// timestamps are taken, but it still adds to wall clock, so keep it short.
-const watchdog_slice_ns: i96 = 10 * std.time.ns_per_ms;
 
 const help_text =
     \\bench - interleaved benchmark driver for kazu, scc, tokei, and mezura
@@ -320,32 +317,46 @@ const CaptureOutcome = union(enum) {
     failed: []const u8,
 };
 
-/// Kills a child that overruns `--timeout`. The watchdog only acts while the
-/// driver is still waiting, so a completed run is never signalled.
+/// Kills a child that overruns `--timeout`. The watchdog waits on an
+/// `Io.Event` with a deadline instead of polling, so a finished run wakes it
+/// immediately and the join costs a futex wake rather than a sleep slice.
+///
+/// It is split in two so the thread spawn lands outside the measured window:
+/// `start` runs before the timer, `arm` hands over the pid and deadline once
+/// the child exists. Thread spawn costs 1-3 ms here, which is a tenth of a
+/// small kazu run and would otherwise be charged to every tool.
 const Watchdog = struct {
     thread: ?std.Thread = null,
-    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Kept so `stop` can signal the events even when `start` bailed out.
+    io: Io = undefined,
+    /// Set when the pid and deadline below are ready for the thread.
+    armed: Io.Event = .unset,
+    /// Set when the run is over and the thread should exit.
+    finished: Io.Event = .unset,
+    /// Published by `arm` before `armed` is set; Event is a release/acquire
+    /// pair, so the thread sees these values after its wait returns.
+    pid: std.posix.pid_t = 0,
+    timeout: Io.Timeout = .none,
     fired_flag: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
-    fn start(self: *Watchdog, io: Io, child: *std.process.Child, timeout_s: f64) void {
+    fn start(self: *Watchdog, io: Io) void {
+        self.io = io;
         if (builtin.os.tag == .windows or builtin.os.tag == .wasi) return;
-        const pid = child.id orelse return;
+        self.thread = std.Thread.spawn(.{}, watch, .{self}) catch null;
+    }
+
+    /// Hands the child and its deadline to the waiting thread.
+    fn arm(self: *Watchdog, child: *const std.process.Child, timeout_s: f64) void {
+        if (self.thread == null) return;
+        self.pid = child.id orelse return;
         const timeout_ns: i96 = @intFromFloat(timeout_s * @as(f64, @floatFromInt(std.time.ns_per_s)));
-        const deadline = Io.Clock.Timestamp.fromNow(io, .{
-            .raw = .{ .nanoseconds = timeout_ns },
-            .clock = .awake,
-        });
-        self.thread = std.Thread.spawn(.{}, watch, .{
-            io,
-            pid,
-            deadline,
-            &self.done,
-            &self.fired_flag,
-        }) catch null;
+        self.timeout = .{ .duration = .{ .raw = .fromNanoseconds(timeout_ns), .clock = .awake } };
+        self.armed.set(self.io);
     }
 
     fn stop(self: *Watchdog) void {
-        self.done.store(true, .release);
+        self.armed.set(self.io);
+        self.finished.set(self.io);
         if (self.thread) |thread| thread.join();
         self.thread = null;
     }
@@ -355,25 +366,25 @@ const Watchdog = struct {
     }
 };
 
-fn watch(
-    io: Io,
-    pid: std.posix.pid_t,
-    deadline: Io.Clock.Timestamp,
-    done: *std.atomic.Value(bool),
-    fired: *std.atomic.Value(bool),
-) void {
-    while (!done.load(.acquire)) {
-        const now = Io.Clock.Timestamp.now(io, .awake);
-        const remaining = deadline.raw.nanoseconds - now.raw.nanoseconds;
-        if (remaining <= 0) {
-            if (done.load(.acquire)) return;
-            fired.store(true, .release);
-            std.posix.kill(pid, std.posix.SIG.KILL) catch {};
-            return;
-        }
-        const slice: i96 = @min(remaining, watchdog_slice_ns);
-        Io.sleep(io, .{ .nanoseconds = slice }, .awake) catch {};
-    }
+fn watch(dog: *Watchdog) void {
+    dog.armed.wait(dog.io) catch return;
+    // `stop` also sets `armed`, so a run that never armed exits here.
+    if (dog.finished.isSet()) return;
+    dog.finished.waitTimeout(dog.io, dog.timeout) catch |err| switch (err) {
+        // The event may have been set between the deadline expiring and this
+        // point; only kill when the run really is still in flight.
+        error.Timeout => {
+            if (dog.finished.isSet()) return;
+            dog.fired_flag.store(true, .release);
+            // The child leads its own process group (spawn uses `.pgid = 0`),
+            // so signal the group: a helper that outlives the tool would keep
+            // its stdout pipe open and stall the capture pass past the
+            // deadline. Fall back to the pid in case the backend ignored it.
+            std.posix.kill(-dog.pid, std.posix.SIG.KILL) catch {};
+            std.posix.kill(dog.pid, std.posix.SIG.KILL) catch {};
+        },
+        error.Canceled => {},
+    };
 }
 
 fn joinArgv(arena: Allocator, argv: []const []const u8) ![]const u8 {
@@ -461,6 +472,11 @@ fn runTimed(
     argv: []const []const u8,
     timeout_s: f64,
 ) !RunOutcome {
+    // Start the watchdog before the timer so its thread spawn is not measured.
+    var dog: Watchdog = .{};
+    dog.start(io);
+    defer dog.stop();
+
     const start = Io.Clock.awake.now(io);
     var child = std.process.spawn(io, .{
         .argv = argv,
@@ -468,18 +484,19 @@ fn runTimed(
         .stdout = .ignore,
         .stderr = .ignore,
         .request_resource_usage_statistics = true,
+        // Own process group so a timeout can kill the whole tree: a helper
+        // that outlives the tool would keep its pipes open.
+        .pgid = 0,
     }) catch |err| return .{ .failed = try spawnFailure(arena, err, argv) };
     defer child.kill(io);
 
-    var dog: Watchdog = .{};
-    dog.start(io, &child, timeout_s);
-    defer dog.stop();
+    dog.arm(&child, timeout_s);
 
     const term = child.wait(io) catch |err| {
         return .{ .failed = try spawnFailure(arena, err, argv) };
     };
-    // Timestamp before joining the watchdog: the join can wait for its current
-    // sleep slice, which must not be charged to the tool.
+    // Timestamp before joining the watchdog: the join is bookkeeping and must
+    // not be charged to the tool.
     const end = Io.Clock.awake.now(io);
     // Stop the watchdog before doing any work: once `wait` returns the pid has
     // been reaped, so a late signal could hit an unrelated process.
@@ -540,17 +557,20 @@ fn runCapture(
     kind: ToolKind,
     timeout_s: f64,
 ) !CaptureOutcome {
+    var dog: Watchdog = .{};
+    dog.start(io);
+    defer dog.stop();
+
     var child = std.process.spawn(io, .{
         .argv = argv,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
+        .pgid = 0,
     }) catch |err| return .{ .failed = try spawnFailure(arena, err, argv) };
     defer child.kill(io);
 
-    var dog: Watchdog = .{};
-    dog.start(io, &child, timeout_s);
-    defer dog.stop();
+    dog.arm(&child, timeout_s);
 
     const stderr_buffer = try arena.alloc(u8, stderr_limit);
     var stderr_len = std.atomic.Value(usize).init(0);
@@ -603,17 +623,20 @@ fn runCapture(
 /// stdout wins when it has content.
 fn toolVersion(arena: Allocator, io: Io, exe: []const u8) []const u8 {
     const argv = [_][]const u8{ exe, "--version" };
+    var dog: Watchdog = .{};
+    dog.start(io);
+    defer dog.stop();
+
     var child = std.process.spawn(io, .{
         .argv = &argv,
         .stdin = .ignore,
         .stdout = .pipe,
         .stderr = .pipe,
+        .pgid = 0,
     }) catch return "unknown";
     defer child.kill(io);
 
-    var dog: Watchdog = .{};
-    dog.start(io, &child, version_timeout_s);
-    defer dog.stop();
+    dog.arm(&child, version_timeout_s);
 
     const stdout_buffer = arena.alloc(u8, 64 * 1024) catch return "unknown";
     const stderr_buffer = arena.alloc(u8, 64 * 1024) catch return "unknown";
@@ -2217,6 +2240,14 @@ pub fn main(init: std.process.Init) !void {
     const generated_at = currentTimeUtc(io, &time_buffer);
 
     std.debug.print("benchmark tools:\n", .{});
+    if (builtin.mode == .debug) {
+        std.debug.print(
+            "warning: this driver is a Debug build; its own startup work and\n" ++
+                "         resident pages inflate wall clock and peak RSS.\n" ++
+                "         Rebuild with 'zig build bench -Doptimize=fast'.\n",
+            .{},
+        );
+    }
     for (tools) |tool| {
         std.debug.print("  {s}: {s} ({s})", .{ tool.name, tool.version, tool.path });
         if (tool.description) |description| std.debug.print(" [{s}]", .{description});

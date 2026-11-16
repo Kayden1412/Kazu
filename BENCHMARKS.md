@@ -32,10 +32,17 @@ zig build -Doptimize=fast
 ```
 
 The cross-tool results below predate the Zig benchmark driver; the original
-harness was `.github/scripts/bench.py`. The driver is now `bench/bench.zig`
-(`zig build bench`), with the same flags and the same interleaved, median-based
-method. It is written in Zig specifically so peak RSS is trustworthy; see
+harness was `.github/scripts/bench.py`. The driver is now `bench/bench.zig`,
+with the same flags and the same interleaved, median-based method. It is
+written in Zig specifically so peak RSS is trustworthy; see
 [Peak RSS measurement](#peak-rss-measurement-2026-11-13).
+
+Build the driver with `zig build bench -Doptimize=fast` before recording
+numbers. A Debug driver does the same work but runs its own bookkeeping in
+Debug mode: measured against the identical fast build on this host, it added
+1–2 ms to a small run and ~1 MiB to every child's peak RSS (kazu read 2.9 MiB
+instead of 2.1 MiB on LangArena). The driver prints a warning when it is a
+Debug build.
 
 ## Peak RSS measurement (2026-11-13)
 
@@ -46,13 +53,13 @@ on LangArena that floor pinned kazu, tokei, and mezura to the same 12.3 MiB.
 `bench/bench.zig` streams each tool's JSON instead of buffering it, which keeps
 a Zig parent near 0.8 MiB and separates the tools again.
 
-Measured with the Zig driver on the same host and binaries (interleaved,
-`taskset -c 0-3`, `--workers 4`, `--no-gitignore`):
+Measured with the fast Zig driver on the same host and binaries (interleaved,
+`taskset -c 0-3`, `--workers 4`, `--no-gitignore`, 7 rounds):
 
 | Workload | kazu | scc | tokei | mezura | Python driver, same tree |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| `kazu src` (7 files, 7 rounds) | 2.9 MiB | 19.5 MiB | 6.3 MiB | 7.0 MiB | 12.5 MiB for kazu, tokei, and mezura |
-| LangArena (765 files, 7 rounds) | 2.4 MiB | 30.1 MiB | 9.5 MiB | 8.4 MiB | 12.3 MiB for kazu, tokei, and mezura |
+| `kazu src` (7 files) | 1.7 MiB | 17.1 MiB | 6.2 MiB | 6.8 MiB | 12.5 MiB for kazu, tokei, and mezura |
+| LangArena (765 files) | 1.9 MiB | 27.2 MiB | 9.3 MiB | 8.3 MiB | 12.3 MiB for kazu, tokei, and mezura |
 
 ## kazu vs scc 4.1.0
 

@@ -248,7 +248,8 @@ the same cloc/tokei/scc line model and counts the files the other tools count;
 `--no-default-config --no-local` keep machine and project settings out. If you
 already built mezura locally, point the driver at its binary and skip the build.
 
-The same driver runs locally; build it with `zig build bench`. Pass the parent
+The same driver runs locally; build it with `zig build bench -Doptimize=fast`
+(the Debug build works but inflates timings and peak RSS). Pass the parent
 directory of the checkouts as an extra `--repo` entry to reproduce the combined
 run:
 
