@@ -24,7 +24,8 @@ const version = "0.1.0";
 const max_file_size: u64 = 256 * 1024 * 1024;
 const max_ignore_size: usize = 1024 * 1024;
 /// Files are counted in chunks so a worker never allocates a buffer the size
-/// of the file.  One buffer is allocated per worker and reused for every file.
+/// of the file.  The batcher owns one buffer per worker and reuses it for every
+/// file and every batch.
 const read_buffer_size: usize = 64 * 1024;
 /// `scc` treats a file as binary when a NUL byte appears in its first 10,000
 /// bytes; grep, git and ripgrep use the same heuristic.  Binary files are not
@@ -349,6 +350,10 @@ const Batcher = struct {
     slots: [2]BatchSlot = .{ .{}, .{} },
     current: usize = 0,
     group: std.Io.Group = .init,
+    /// One reusable read buffer per worker, shared by both slots. `dispatch`
+    /// and `flush` await the running batch before starting another one, so at
+    /// most one group reads at a time and the pool never needs duplicating.
+    read_buffers: []u8 = &.{},
 
     const BatchSlot = struct {
         tasks: std.ArrayList(FileTask) = .empty,
@@ -399,22 +404,37 @@ const Batcher = struct {
         slot.next = std.atomic.Value(usize).init(0);
         var spawned: usize = 0;
         const wanted = @min(self.workers, slot.tasks.items.len);
+        try self.ensureReadBuffers(wanted);
         while (spawned < wanted) : (spawned += 1) {
             // A failed spawn is fine as long as at least one worker runs: the
             // shared counter keeps every worker busy until the batch is empty.
             self.group.concurrent(self.io, batchWorker, .{
                 self.io,
-                self.gpa,
                 slot.tasks.items,
                 slot.results.items,
                 &slot.next,
+                self.workerBuffer(spawned),
             }) catch break;
         }
         if (spawned == 0) {
             // No concurrency available (for example a single-threaded `Io`
             // implementation); count the batch on this thread.
-            batchWorker(self.io, self.gpa, slot.tasks.items, slot.results.items, &slot.next) catch {};
+            batchWorker(self.io, slot.tasks.items, slot.results.items, &slot.next, self.workerBuffer(0)) catch {};
         }
+    }
+
+    /// Grow the pool to `wanted` worker buffers.  Called before a batch starts,
+    /// while no group is in flight, so growing cannot invalidate a buffer a
+    /// worker is reading.
+    fn ensureReadBuffers(self: *Batcher, wanted: usize) !void {
+        const needed = wanted * read_buffer_size;
+        if (self.read_buffers.len >= needed) return;
+        self.read_buffers = try self.gpa.realloc(self.read_buffers, needed);
+    }
+
+    fn workerBuffer(self: *const Batcher, index: usize) []u8 {
+        const offset = index * read_buffer_size;
+        return self.read_buffers[offset..][0..read_buffer_size];
     }
 
     fn fold(self: *Batcher, index: usize) void {
@@ -490,6 +510,7 @@ const Batcher = struct {
             slot.tasks.deinit(self.gpa);
             slot.results.deinit(self.gpa);
         }
+        self.gpa.free(self.read_buffers);
     }
 };
 
@@ -550,17 +571,11 @@ fn run(init: std.process.Init, config: Config) !void {
 
 fn batchWorker(
     io: std.Io,
-    gpa: std.mem.Allocator,
     tasks: []const FileTask,
     results: []?FileResult,
     next: *std.atomic.Value(usize),
+    buffer: []u8,
 ) std.Io.Cancelable!void {
-    const buffer = gpa.alloc(u8, read_buffer_size) catch |err| {
-        std.log.err("kazu: cannot allocate read buffer: {}", .{err});
-        return;
-    };
-    defer gpa.free(buffer);
-
     while (true) {
         const index = next.fetchAdd(1, .monotonic);
         if (index >= tasks.len) return;
@@ -1317,6 +1332,35 @@ test "binary detection only scans the first 10000 bytes" {
     // The NUL is checked only while it falls inside the prefix.
     try std.testing.expect(!isBinaryChunk("ab\x00", 9_998));
     try std.testing.expect(isBinaryChunk("ab\x00", 9_997));
+}
+
+test "read buffer pool grows to the worker count and is reused" {
+    const io = std.testing.io;
+    const gpa = std.testing.allocator;
+
+    var batcher = Batcher{ .gpa = gpa, .io = io, .workers = 3, .stats = &.{} };
+    defer batcher.deinit();
+
+    // Nothing is allocated before the first batch asks for workers.
+    try std.testing.expectEqual(@as(usize, 0), batcher.read_buffers.len);
+    try batcher.ensureReadBuffers(2);
+    try std.testing.expectEqual(@as(usize, 2 * read_buffer_size), batcher.read_buffers.len);
+
+    const first = batcher.workerBuffer(0);
+    const second = batcher.workerBuffer(1);
+    try std.testing.expectEqual(@as(usize, read_buffer_size), first.len);
+    try std.testing.expectEqual(@as(usize, read_buffer_size), second.len);
+    try std.testing.expect(first.ptr != second.ptr);
+
+    // The same index keeps the same buffer, so a dispatch reuses the pool.
+    try std.testing.expectEqual(first.ptr, batcher.workerBuffer(0).ptr);
+
+    // Growing keeps the lower indices and never shrinks.
+    try batcher.ensureReadBuffers(1);
+    try std.testing.expectEqual(@as(usize, 2 * read_buffer_size), batcher.read_buffers.len);
+    try batcher.ensureReadBuffers(3);
+    try std.testing.expectEqual(@as(usize, 3 * read_buffer_size), batcher.read_buffers.len);
+    try std.testing.expectEqual(@as(usize, 3), batcher.read_buffers.len / read_buffer_size);
 }
 
 test "symlink dedup compares walked paths with resolved targets" {

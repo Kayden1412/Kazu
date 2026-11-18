@@ -72,10 +72,10 @@ the driver as `zig-out/bin/bench`; the default install step does not build it.
    Workers read the file in 64 KiB chunks through `std.Io` (or sniff a `#!`
    line when the language is unknown), reject a file whose first 10,000 bytes
    contain a NUL, enforce the 256 MiB limit while reading (statting only when
-   the first read fills the buffer), and feed the rest to `count.Counter`. Each
-   worker owns one reusable read buffer; nothing is allocated per file. Results
-   are written into a pre-sized slot array, so no channel or collector is
-   involved.
+   the first read fills the buffer), and feed the rest to `count.Counter`. The
+   batcher owns one reusable read buffer per worker for the whole run, so a
+   dispatch allocates nothing; results go into a pre-sized slot array, so no
+   channel or collector is involved.
 5. `Batcher.flush` finishes the batch left over from the walk: it awaits the
    in-flight slot, then counts and folds the tail batch. Folding frees the
    paths and adds each `FileResult` to the `format.Summary` for its language.
