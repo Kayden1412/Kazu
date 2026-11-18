@@ -313,20 +313,20 @@ fn writeJsonString(writer: *std.Io.Writer, text: []const u8) !void {
 }
 
 fn writeJsonFile(writer: *std.Io.Writer, file: FileSummary) !void {
-    try writer.writeAll("  {\n    \"Name\": ");
+    try writer.writeAll("{\"Name\":");
     try writeJsonString(writer, displayPath(file.path));
-    try writer.writeAll(",\n    \"Language\": ");
+    try writer.writeAll(",\"Language\":");
     try writeJsonString(writer, file.language());
-    try writer.writeAll(",\n    \"Files\": 1");
-    try writer.writeAll(",\n    \"Lines\": ");
+    try writer.writeAll(",\"Files\":1");
+    try writer.writeAll(",\"Lines\":");
     try writer.print("{d}", .{file.lines});
-    try writer.writeAll(",\n    \"Blank\": ");
+    try writer.writeAll(",\"Blank\":");
     try writer.print("{d}", .{file.blank});
-    try writer.writeAll(",\n    \"Comment\": ");
+    try writer.writeAll(",\"Comment\":");
     try writer.print("{d}", .{file.comment});
-    try writer.writeAll(",\n    \"Code\": ");
+    try writer.writeAll(",\"Code\":");
     try writer.print("{d}", .{file.code});
-    try writer.writeAll("\n  }");
+    try writer.writeAll("}");
 }
 
 fn writeJson(
@@ -335,35 +335,35 @@ fn writeJson(
     files: ?[]const FileSummary,
 ) !void {
     if (files) |list| {
-        try writer.writeAll("[\n");
+        try writer.writeAll("[");
         for (list, 0..) |file, i| {
             try writeJsonFile(writer, file);
             if (i + 1 < list.len) try writer.writeByte(',');
-            try writer.writeByte('\n');
+            //try writer.writeByte('\n');
         }
-        try writer.writeAll("]\n");
+        try writer.writeAll("]");
         return;
     }
 
-    try writer.writeAll("[\n");
+    try writer.writeAll("[");
     for (rows, 0..) |row, i| {
-        try writer.writeAll("  {\n    \"Name\": ");
+        try writer.writeAll("{\"Name\":");
         try writeJsonString(writer, row.name());
-        try writer.writeAll(",\n    \"Files\": ");
+        try writer.writeAll(",\"Files\":");
         try writer.print("{d}", .{row.files});
-        try writer.writeAll(",\n    \"Lines\": ");
+        try writer.writeAll(",\"Lines\":");
         try writer.print("{d}", .{row.lines});
-        try writer.writeAll(",\n    \"Blank\": ");
+        try writer.writeAll(",\"Blank\":");
         try writer.print("{d}", .{row.blank});
-        try writer.writeAll(",\n    \"Comment\": ");
+        try writer.writeAll(",\"Comment\":");
         try writer.print("{d}", .{row.comment});
-        try writer.writeAll(",\n    \"Code\": ");
+        try writer.writeAll(",\"Code\":");
         try writer.print("{d}", .{row.code});
-        try writer.writeAll("\n  }");
+        try writer.writeAll("}");
         if (i + 1 < rows.len) try writer.writeByte(',');
-        try writer.writeByte('\n');
+        //try writer.writeByte('\n');
     }
-    try writer.writeAll("]\n");
+    try writer.writeAll("]");
 }
 
 fn writeMarkdownEscaped(writer: *std.Io.Writer, text: []const u8) !void {
