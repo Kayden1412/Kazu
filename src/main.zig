@@ -333,7 +333,12 @@ fn defaultWorkers() usize {
     return @min(@max(cpus, 1), 16);
 }
 
-const batch_size: usize = 4096;
+/// Files per batch.  1024 starts counting while the walk is still running on a
+/// medium tree, where 4096 only dispatches after the walk has ended: a 5k-file
+/// tree gained ~5%.  The cost is the extra thread spawns per batch, and it only
+/// shows on very large trees (~1.6% on 20,000 tiny files).  512 is worse there
+/// and no better elsewhere, so this is the smallest batch worth using.
+const batch_size: usize = 1024;
 
 /// Walks the tree and hands batches of files to a short-lived worker group.
 /// Keeping the queue out of the hot path avoids per-file channel wakeups: each

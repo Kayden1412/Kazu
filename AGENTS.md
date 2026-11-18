@@ -65,7 +65,7 @@ the driver as `zig-out/bin/bench`; the default install step does not build it.
    ownership of the path string; the batch frees it. It returns whether the
    file was queued, which lets `queueWalked` record the canonical path in the
    `--include-symlinks` dedup set only for counted files.
-4. `Batcher.push` dispatches a full batch (4096 files) and switches to the
+4. `Batcher.push` dispatches a full batch (1024 files) and switches to the
    other of two batch slots, so the walker can fill the next batch while the
    current one is counted. `Batcher.dispatch`/`start` split a batch across a
    short-lived `std.Io.Group` with one `std.atomic.Value(usize)` per slot.
@@ -301,8 +301,12 @@ Single-shot timings are meaningless on a shared host.
   produced ~35k futex calls and was 1.9-2.5x slower. The batch + atomic counter
   design exists specifically to avoid it.
 - `std.Io.Group.concurrent` spawns OS threads on the threaded backend, so a
-  batch of 4096 files costs at most `--workers` spawns. Keep the batch large
-  enough to amortize that; do not flush per directory.
+  batch costs at most `--workers` spawns (~1-3 ms each on this host). That is
+  why the batch size is 1024 rather than smaller: 512 buys nothing over 1024 on
+  medium trees and costs ~5% on 20,000 tiny files, while 1024 still lets
+  counting start while the walk is running on a 5k-file tree (4096 dispatches
+  only after the walk ends there). Do not flush per directory, and re-measure
+  before changing the constant.
 - The walk must stay on `std.Io.Dir.walkSelectively`, not a recursive helper.
   `enter` is what descends, so an excluded or ignored directory is pruned with
   a single readdir entry and never opened. Ignore-file scope is tracked by

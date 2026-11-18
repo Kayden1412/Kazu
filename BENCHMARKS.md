@@ -462,6 +462,55 @@ Output was byte-identical to the base build on `src`, LangArena (summary and
 `--by-file`), the cargo tree, and a two-root run that grows the pool between
 roots; `bs build test` passes.
 
+## Batch size (2026-11-18)
+
+`batch_size` was 4096. `push` only dispatches a full batch, so on a tree
+smaller than that the whole walk runs before the first file is counted: the
+first batch is a serial prefix in front of all the counting. Lowering it starts
+counting earlier, at the cost of more `Group.concurrent` calls, each of which
+spawns `--workers` OS threads (~1-3 ms per spawn on this host).
+
+Builds differ only in the constant. Paired A/B against the 4096 build,
+alternating which binary runs first, `taskset -c 0-3 --workers 4`,
+`--no-gitignore`: 24 pairs on LangArena, 8 on the 5,003-file cargo registry
+tree, 18 on `/usr/include` (10,092 files), 6 on detbench (20,000 tiny files).
+Delta is the mean of the per-pair differences ± its standard error, in ms;
+the parenthetical is how often the smaller batch won.
+
+| Workload | 512 vs 4096 | 1024 vs 4096 | 2048 vs 4096 |
+| --- | ---: | ---: | ---: |
+| LangArena (765 files) | +6 ± 10 (13/24) | -8 ± 9 (14/24) | -3 ± 10 (9/24) |
+| cargo registry (5,003 files) | -128 ± 26 (8/8) | -228 ± 87 (8/8) | -44 ± 61 (6/8) |
+| `/usr/include` (10,092 files) | -395 ± 227 (16/18) | -153 ± 121 (9/18) | +200 ± 185 (1/6) |
+| detbench (20,000 tiny files) | +991 ± 729 (0/6) | +38 ± 21 (1/6) | — |
+
+LangArena fits in one batch at every size, so its deltas are dispatch timing
+noise, not batch effects. The medium trees are where the change shows: the
+cargo tree is the smallest workload that spans two batches at 4096, and both
+512 and 1024 beat it there by 5-7% (median -129 and -107 ms, 8/8 each).
+`/usr/include` also spans only three batches at 4096, and 512 wins there in
+16/18 pairs, though the mean is carried by two -1.1 s and -4.0 s outliers and
+the median gain is -94 ms.
+
+The cost appears on directory-heavy trees full of tiny files: at 512, detbench
+loses in all six pairs (median +219 ms, about +5%), because 40 batches each pay
+for four thread spawns, and spawning dominates counting 1-line files.
+
+1024 is the compromise: 5% on a 5k-file tree, ~1.5% on 20,000 tiny files, and
+inside the noise elsewhere. 2048 gains nothing over 4096 on any workload and
+loses on `/usr/include`. Note that 512's apparent RSS advantage (0.4-1.0 MiB
+lower in every pair) did not reproduce at 1024: RSS for the same 4096 build
+moved by 0.44 MiB between blocks, and a direct 2048-vs-1024 run put both at
+2.96 MiB, so that is run order, not batch size.
+
+A two-tier scheme (first batch 512, then 4096) was also built and measured. It
+showed no gain: LangArena +1 ± 29 ms, detbench +15 ± 25, cargo +127 ± 96,
+`/usr/include` -214 ± 121 (7/12), dirheavy4 -4.1 ± 2.5 s from one outlier pair
+(5/6). The complexity was not justified, so only the constant changed.
+
+Counts are unchanged: output is byte-identical to the 4096 build on LangArena
+(summary and `--by-file`) and on the cargo tree, and `bs build test` passes.
+
 ## Conclusions
 
 - kazu beats scc on every measured workload: LangArena x4 0.78x, LangArena
