@@ -425,6 +425,43 @@ removal alone was worth 0.87x on LangArena and 0.75x on detbench.
 Output was byte-identical to the base build on `src`, LangArena, detbench,
 dirheavy4, walkheavy, and `--by-file`; `bs build test` passes.
 
+## Worker read buffers (2026-11-18)
+
+`batchWorker` used to allocate a 64 KiB buffer per worker on every dispatch and
+free it when the batch ended. The pool now lives in `Batcher`: one buffer per
+worker, grown lazily to the number of workers a batch actually starts, sliced by
+spawn index and passed to the worker. Both batch slots share it, because
+`dispatch` and `flush` await the running batch before starting another, so only
+one group reads at a time; a per-slot pool would double the buffer memory on any
+tree larger than one batch.
+
+Paired A/B, base `8050c89` vs `c640c10`, `taskset -c 0-3 --workers 4`,
+`--no-gitignore`, alternating which binary runs first. Each pair is one round,
+then the per-pair differences are summarised; `src` and LangArena use 30 pairs,
+the 4,218-file cargo registry tree (two batches) uses 20.
+
+| Workload | Wall (new / base) | Paired delta wall | CPU (new / base) | Paired delta CPU | Peak RSS (new / base) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `kazu src` (7 files) | 16.4 / 15.7 ms | +1.0 ± 1.7 ms | 14.6 / 14.1 ms | -0.1 ± 0.4 ms | 2.30 / 2.34 MiB |
+| LangArena (765 files) | 454.4 / 433.8 ms | +19 ± 23 ms | 378.2 / 373.5 ms | -11 ± 11 ms | 2.46 / 2.54 MiB |
+| cargo registry (4,218 files) | 2.69 / 2.81 s | -15 ± 122 ms | 2.32 / 2.33 s | -0.7 ± 55 ms | 3.32 / 3.39 MiB |
+
+Delta is the mean of the per-pair differences and its standard error. Every
+wall and CPU delta sits inside one standard error, and the cargo wall delta
+changed sign between the first 8 pairs (+255 ms) and all 20 (-15 ms), so the
+change is neutral in time: it removes six to twelve allocations per run, which
+is below what this host can resolve. Peak RSS is lower in every pair (30/30 and
+20/20) by 50-70 KiB, because one pooled allocation replaces four separate 64 KiB
+blocks per dispatch.
+
+Absolute LangArena wall clock read 434-454 ms here against the 289-340 ms
+recorded on 2026-11-16 for the same code; the host throttles across sessions, so
+only the within-pair comparison is meaningful.
+
+Output was byte-identical to the base build on `src`, LangArena (summary and
+`--by-file`), the cargo tree, and a two-root run that grows the pool between
+roots; `bs build test` passes.
+
 ## Conclusions
 
 - kazu beats scc on every measured workload: LangArena x4 0.78x, LangArena
